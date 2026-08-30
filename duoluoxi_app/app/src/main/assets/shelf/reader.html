@@ -8,7 +8,7 @@
 * { box-sizing:border-box; margin:0; padding:0; -webkit-tap-highlight-color:transparent; }
 :root { --bg:#13151a; --card:#1b1e25; --fg:#b9bec9; --dim:#767c8a; --acc:#e8a33d; --line:#252a33; }
 body.light { --bg:#f6f2e9; --card:#fffcf5; --fg:#3a372e; --dim:#8f887a; --line:#e5deca; }
-body { background:var(--bg); color:var(--fg); font:17px/1.78 "Microsoft YaHei",sans-serif; transition:background .3s,color .3s; }
+body { background:var(--bg); color:var(--fg); font:17px/1.78 "Microsoft YaHei",sans-serif; transition:background .3s,color .3s; overflow-x:hidden; }
 .topbar { position:sticky; top:0; z-index:10; background:var(--bg); border-bottom:1px solid var(--line); display:flex; align-items:center; padding:11px 14px; gap:6px; }
 .topbar .back { font-size:20px; cursor:pointer; padding:2px 8px; }
 .topbar .t { flex:1; text-align:center; font-size:14px; color:var(--dim); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
@@ -164,7 +164,13 @@ function showChapters(v) {
 var tkCache = {}
 var curChapter = 1, curPage = 1, pageCount = 1
 var currentRawLines = []   // 当前章原始段落文本（重排用）
-var currentTkByPara = null // 当前章段评 map
+var currentTkByPara = null // 当前章段评 map（key=txt 行号，已按段落映射对齐）
+var curMap = null          // 当前章段落映射信息 {maxP, L, needMap}
+// 服务端段落号 → txt 行号（与 loadChapter 构建 byPara 同一规则）
+function mapParaToLine(n) {
+  if (!curMap || !curMap.needMap || !curMap.maxP) return n
+  return Math.min(curMap.L - 1, Math.round(n * (curMap.L - 1) / curMap.maxP))
+}
 var pagesEl = document.getElementById('pages')
 
 // ---- 番茄式行级分页：段落按行切，行可跨页，页面被文字填满 ----
@@ -269,14 +275,16 @@ function layoutPages(rawLines) {
   }).join('')
   return pages.length
 }
-function showPage(p) {
+function showPage(p, dir) {
   if (p < 1 || p > pageCount) return false
+  var idx = p - 1
   curPage = p
-  pagesEl.querySelectorAll('.page').forEach(function(el) {
-    el.classList.toggle('active', Number(el.dataset.pg) === p - 1)
-  })
   document.getElementById('pgInfo').textContent = p + ' / ' + pageCount
   try { localStorage.setItem('prog:' + bookId, curChapter + ':' + curPage) } catch(e){}
+  // 无动画直接切换（dir 参数保留兼容调用处）
+  pagesEl.querySelectorAll('.page').forEach(function(el) {
+    el.classList.toggle('active', Number(el.dataset.pg) === idx)
+  })
   return true
 }
 
@@ -293,13 +301,26 @@ async function loadChapter(i, toPage) {
     if (titleMatch) title = titleMatch[1]
     document.getElementById('chapterTitle').textContent = title
 
-    // 段评
+    // 段评（服务端段落号 ↔ EPUB 行号映射：EPUB 段落粒度粗，部分章服务端段落号超过 txt 行数，
+    // 按比例映射到最近行，防止段评错位/丢失；段落号未越界的章节映射后不变）
     var byPara = new Map()
+    curMap = null
     if (meta.has_tsukkomi) {
       try {
         var tk = JSON.parse(await get('tsukkomi/' + pad(i) + '.json'))
         tkCache[i] = tk
-        for (var p of (tk.paragraphs || [])) byPara.set(Number(p.paragraph_index), p.tsukkomi || [])
+        var maxP = 0
+        for (var p of (tk.paragraphs || [])) { var n = Number(p.paragraph_index); if (n > maxP) maxP = n }
+        var L = lines.length          // 含标题行：行号 0..L-1
+        var needMap = maxP > L - 1    // 服务端段落号超出 txt 行数才映射
+        curMap = { maxP: maxP, L: L, needMap: needMap }
+        for (var p of (tk.paragraphs || [])) {
+          var n = Number(p.paragraph_index)
+          var key = needMap ? Math.min(L - 1, Math.round(n * (L - 1) / maxP)) : n
+          var arr = byPara.get(key) || []
+          arr = arr.concat(p.tsukkomi || [])
+          byPara.set(key, arr)
+        }
       } catch(e) { tkCache[i] = null }
     }
 
@@ -329,11 +350,11 @@ function pad(n) { return String(n).padStart(4, '0') }
 
 // ---- 页级翻页（供按钮、点击、滑动、音量键共用）----
 function prevPage() {
-  if (curPage > 1) { showPage(curPage - 1); updateNavButtons() }
+  if (curPage > 1) { showPage(curPage - 1, -1); updateNavButtons() }
   else if (curChapter > 1) loadChapter(curChapter - 1, -1)   // 上一章末页
 }
 function nextPage() {
-  if (curPage < pageCount) { showPage(curPage + 1); updateNavButtons() }
+  if (curPage < pageCount) { showPage(curPage + 1, 1); updateNavButtons() }
   else if (curChapter < total) loadChapter(curChapter + 1, 1) // 下一章首页
 }
 function updateNavButtons() {
@@ -378,7 +399,19 @@ var curPara = 0, curChap = 0
 function showTks(para, chap) {
   curPara = para; curChap = chap
   var tk = tkCache[chap]
-  var list = tk && tk.paragraphs ? (tk.paragraphs.find(function(p){return Number(p.paragraph_index)===para}) || {}).tsukkomi || [] : []
+  // para 是 txt 行号；用段落映射收集所有映射到该行的段评（服务端段落粒度更细时多段并到一行）
+  var list = []
+  if (tk && tk.paragraphs) {
+    for (var p of tk.paragraphs) {
+      if (mapParaToLine(Number(p.paragraph_index)) === para) {
+        list = list.concat(p.tsukkomi || [])
+      }
+    }
+  }
+  // 服务端返回倒序（最新在上），官方 App 正序显示（1 楼在上）：按 lou 升序排
+  list = list.slice().sort(function(a, b) {
+    return (Number(a.lou) || 0) - (Number(b.lou) || 0)
+  })
   document.getElementById('tkCount').textContent = list.length
   var h = ''
   list.forEach(function(t) {

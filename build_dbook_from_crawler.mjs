@@ -138,7 +138,8 @@ async function fetchBookInfo(bookId) {
 function findDivs(bookId) {
   const bdir = path.join(DATA_ROOT, bookId)
   if (!fs.existsSync(bdir)) return []
-  return fs.readdirSync(bdir).filter(d => /^\d+$/.test(d)).sort()
+  // ★数字排序，字典序会让 ≥10 卷乱序
+  return fs.readdirSync(bdir).filter(d => /^\d+$/.test(d)).sort((a, b) => Number(a) - Number(b))
 }
 
 async function build(bookId, textDir) {
@@ -146,7 +147,7 @@ async function build(bookId, textDir) {
   if (!divs.length) { console.error(`✗ 没找到 ${bookId} 的抓取数据（ciweimao_data/${bookId}/）`); process.exit(1) }
 
   // 合并所有卷的章节与段评（多卷书章节索引连续递增，tsukkomi 文件按章节号存）
-  let chapters = []
+  const chapters = []
   const tkFiles = []
   for (const divId of divs) {
     const base = path.join(DATA_ROOT, bookId, divId)
@@ -164,24 +165,36 @@ async function build(bookId, textDir) {
     }
   }
   // 重排全局章节索引：跨卷时 chapters 数组顺序 = 阅读顺序，索引连续分配
-  const indexMap = {}   // 原始 chapter_index -> 全局序号
+  // ★每卷 chapter_index 都从 1 开始，只用 chapter_index 去重会丢掉卷2+全部章节。
+  //   按出现顺序无条件分配全局序号（同卷同 index 只出现一次，天然正确）。
   const ordered = []
-  for (const c of chapters) {
-    if (!(c.chapter_index in indexMap)) {
-      indexMap[c.chapter_index] = ordered.length + 1
+  const keyToGlobal = {} // 'divId:chapter_index' -> 全局序号（段评映射用）
+  for (const divId of divs) {
+    const cjFile = path.join(DATA_ROOT, bookId, divId, '_chapters.json')
+    if (!fs.existsSync(cjFile)) continue
+    const ch = JSON.parse(fs.readFileSync(cjFile, 'utf8'))
+    for (const c of ch) {
       ordered.push(c)
+      c._g = ordered.length
+      keyToGlobal[divId + ':' + c.chapter_index] = ordered.length
     }
   }
   const chaptersFinal = ordered
   const titles = {}
-  for (const c of chaptersFinal) titles[String(indexMap[c.chapter_index])] = c.chapter_title || ''
+  for (const c of chaptersFinal) titles[String(c._g)] = c.chapter_title || ''
   // 段评文件映射到全局序号：某卷内 tsukkomi/NNNN.json 对应同卷 _chapters.json 里 chapter_index=NNN 的全局序号
+  // ★每卷 _chapters.json 只解析一次（原实现对每个段评文件重复读、缺文件直接崩溃）
+  const divChapterCache = {}
+  for (const divId of divs) {
+    const cjFile = path.join(DATA_ROOT, bookId, divId, '_chapters.json')
+    divChapterCache[divId] = fs.existsSync(cjFile) ? JSON.parse(fs.readFileSync(cjFile, 'utf8')) : []
+  }
   const tkByGlobal = new Map()
   for (const { divId, file } of tkFiles) {
     const idx = file.replace(/^0+/, '').replace(/\.json$/, '')
-    const divChapters = JSON.parse(fs.readFileSync(path.join(DATA_ROOT, bookId, divId, '_chapters.json'), 'utf8'))
+    const divChapters = divChapterCache[divId] || []
     const match = divChapters.find(c => String(c.chapter_index) === idx)
-    const globalIdx = match ? indexMap[match.chapter_index] : null
+    const globalIdx = match ? keyToGlobal[divId + ':' + match.chapter_index] : null
     if (globalIdx) tkByGlobal.set(globalIdx, { file, divId })
   }
 
@@ -217,7 +230,7 @@ async function build(bookId, textDir) {
   files.push({ name: 'meta.json', data: Buffer.from(JSON.stringify({ ...meta, titles }), 'utf8') })
   if (textDir) {
     for (const c of chaptersFinal) {
-      const pad = String(indexMap[c.chapter_index]).padStart(4, '0')
+      const pad = String(c._g).padStart(4, '0')
       for (const sub of ['book-chapters', 'chapters']) {
         const f = path.join(textDir, sub, pad + '.txt')
         if (fs.existsSync(f)) { files.push({ name: `chapters/${pad}.txt`, data: fs.readFileSync(f) }); break }

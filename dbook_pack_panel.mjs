@@ -7,6 +7,7 @@ import path from 'node:path'
 import http from 'node:http'
 import zlib from 'node:zlib'
 import { createHash, createHmac, createDecipheriv, randomBytes } from 'node:crypto'
+import { fileURLToPath } from 'node:url'
 
 const APP_VERSION = '2.9.365'
 const DEVICE_TOKEN = 'ciweimao_'
@@ -14,7 +15,8 @@ const AES_KEY_STR = 'sD6doAOcW7hm7iaeK6UlcdtAIWlZGlBr'
 const HMAC_KEY = 'a90f3731745f1c30ee77cb13fc00005a'
 const SIGNATURES = HMAC_KEY + 'CkMxWNB666'
 const UA = 'Android  com.kuangxiangciweimao.novel.c  2.9.365, Xiaomi, 24030PN60G, 34, 14'
-const _here = path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'))
+// ★fileURLToPath 正确处理含空格/中文的路径（pathname 会被百分号编码）
+const _here = path.dirname(fileURLToPath(import.meta.url))
 const DATA_ROOT = process.env.CIWEMAO_DATA || path.join(_here, 'ciweimao_data')
 const QIDIAN_ROOT = process.env.QIDIAN_DATA || path.join(_here, 'qidian_data')
 const TOKEN_FILE = process.env.CIWEMAO_TOKEN || path.join(_here, '_ciweimao_app_token.json')
@@ -181,9 +183,12 @@ function buildDbook(meta, files, outFile) {
 async function packBook(bookId, textDir, platform) {
   if (platform === 'qidian') return packQidian(bookId, textDir)
   // ---- 刺猬猫（多卷合并） ----
-  const divs = fs.readdirSync(path.join(DATA_ROOT, bookId)).filter(d => /^\d+$/.test(d)).sort()
+  // ★字典序排序会让卷号 ≥10 时 "10" < "2"，全局章节顺序错乱，必须按数字排
+  const divs = fs.readdirSync(path.join(DATA_ROOT, bookId)).filter(d => /^\d+$/.test(d)).sort((a, b) => Number(a) - Number(b))
   if (!divs.length) throw new Error('没有卷数据')
-  let chapters = []
+  const chapters = []
+  // ★多卷每卷 chapter_index 都从 1 开始，只用 chapter_index 去重会丢掉卷2+全部章节。
+  //   用 (divId, chapter_index) 复合键：只防同卷重复出现，不防跨卷重号。
   const indexMap = {}
   const ordered = []
   for (const divId of divs) {
@@ -191,12 +196,16 @@ async function packBook(bookId, textDir, platform) {
     if (!fs.existsSync(cjFile)) continue
     const ch = JSON.parse(fs.readFileSync(cjFile, 'utf8'))
     for (const c of ch) {
-      if (!(c.chapter_index in indexMap)) { indexMap[c.chapter_index] = ordered.length + 1; ordered.push(c) }
+      const key = divId + ':' + c.chapter_index
+      if (!(key in indexMap)) {
+        indexMap[key] = ordered.length + 1
+        c._g = ordered.length + 1
+        ordered.push(c)
+      }
     }
-    chapters = ordered
   }
   const titles = {}
-  for (const c of ordered) titles[String(indexMap[c.chapter_index])] = c.chapter_title || ''
+  for (const c of ordered) titles[String(c._g)] = c.chapter_title || ''
   // 段评映射
   const tkByGlobal = new Map()
   for (const divId of divs) {
@@ -208,7 +217,7 @@ async function packBook(bookId, textDir, platform) {
       if (!f.endsWith('.json') || f.startsWith('_')) continue
       const idx = f.replace(/^0+/, '').replace(/\.json$/, '')
       const match = divChapters.find(c => String(c.chapter_index) === idx)
-      const gIdx = match ? indexMap[match.chapter_index] : null
+      const gIdx = match ? indexMap[divId + ':' + match.chapter_index] : null
       if (gIdx) tkByGlobal.set(gIdx, { file: f, divId })
     }
   }
@@ -243,7 +252,7 @@ async function packBook(bookId, textDir, platform) {
   files.push({ name: 'meta.json', data: Buffer.from(JSON.stringify({ ...meta, titles }), 'utf8') })
   if (textDir && fs.existsSync(textDir)) {
     for (const c of ordered) {
-      const pad = String(indexMap[c.chapter_index]).padStart(4, '0')
+      const pad = String(c._g).padStart(4, '0')
       for (const sub of ['book-chapters', 'chapters']) {
         const f = path.join(textDir, sub, pad + '.txt')
         if (fs.existsSync(f)) { files.push({ name: `chapters/${pad}.txt`, data: fs.readFileSync(f) }); break }
@@ -452,8 +461,10 @@ const server = http.createServer(async (req, res) => {
       const { book_id, with_text, platform } = JSON.parse(body || '{}')
       const pf = platform === 'qidian' ? 'qidian' : 'ciweimao'
       const root = pf === 'qidian' ? QIDIAN_ROOT : DATA_ROOT
-      if (!book_id || !fs.existsSync(path.join(root, String(book_id)))) { send(400, { ok: false, error: '没有这本书的数据' }); return }
-      const r = await packBook(String(book_id), with_text || null, pf)
+      // ★路径穿越防护：book_id 必须是纯数字
+      if (!/^\d+$/.test(String(book_id || ''))) { send(400, { ok: false, error: 'book_id 必须是纯数字' }); return }
+      if (!fs.existsSync(path.join(root, String(book_id)))) { send(400, { ok: false, error: '没有这本书的数据' }); return }
+      const r = await packBook(String(book_id), typeof with_text === 'string' ? with_text : null, pf)
       log(`✅ ${r.meta.book_name} → ${r.outFile}（${(r.size/1048576).toFixed(1)} MB, ${r.meta.chapter_count} 章, ${r.meta.tsukkomi_count} 条段评${r.divisions > 1 ? ', ' + r.divisions + ' 卷' : ''}）`, 'ok')
       send(200, { ok: true, book_name: r.meta.book_name, file: r.outFile, size_mb: (r.size/1048576).toFixed(1), chapters: r.meta.chapter_count, tsukkomi: r.meta.tsukkomi_count, divisions: r.divisions })
     } catch (e) {

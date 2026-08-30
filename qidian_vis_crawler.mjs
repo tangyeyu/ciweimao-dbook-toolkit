@@ -28,6 +28,26 @@ function connect(wsUrl) {
     const ws = new WebSocket(wsUrl)
     let id = 0
     const pending = new Map()
+    // ★断线/错误处理必须在 open 前接线（open 后断线时：reject 全部 pending + 置 cdp=null 触发重建）
+    ws.onerror = e => {
+      reject(new Error('ws: ' + e.message))
+      for (const [, p] of pending) p.rej(new Error('CDP 连接断开'))
+      pending.clear()
+    }
+    ws.onclose = () => {
+      for (const [, p] of pending) p.rej(new Error('CDP 连接断开'))
+      pending.clear()
+      // 断线后全局 cdp 置空，下次 ensureCdp 自动重建连接
+      cdp = null
+    }
+    ws.onmessage = ev => {
+      const msg = JSON.parse(ev.data)
+      if (msg.id && pending.has(msg.id)) {
+        const p = pending.get(msg.id)
+        pending.delete(msg.id)
+        msg.error ? p.rej(new Error(msg.error.message)) : p.res(msg.result)
+      }
+    }
     ws.onopen = () => resolve({
       call(method, params = {}) {
         return new Promise((res, rej) => {
@@ -38,15 +58,6 @@ function connect(wsUrl) {
       },
       close() { ws.close() },
     })
-    ws.onerror = e => reject(new Error('ws: ' + e.message))
-    ws.onmessage = ev => {
-      const msg = JSON.parse(ev.data)
-      if (msg.id && pending.has(msg.id)) {
-        const p = pending.get(msg.id)
-        pending.delete(msg.id)
-        msg.error ? p.rej(new Error(msg.error.message)) : p.res(msg.result)
-      }
-    }
   })
 }
 async function evaluate(expr) {
@@ -71,7 +82,9 @@ async function getCsrf() {
 }
 
 // 导航到书页，等渲染后从 DOM 提取书名 + 章节列表（页面上下文 fetch HTML 会被 WAF 挑战页拦截，导航方式可行）
+// ★导航会销毁页面执行上下文：任务运行中禁止调用（否则在途 evaluate 全部报 context destroyed → 批量失败）
 async function getCatalogByNav(bookId) {
+  if (task && task.running) throw new Error('任务正在运行，不能导航查书（会销毁抓取中的页面上下文），请先停止')
   await evaluate(`location.href = ${JSON.stringify('https://www.qidian.com/book/' + bookId + '/')}; 'nav'`)
   await sleep(3500)
   const data = await evaluate(`(() => {
@@ -177,6 +190,8 @@ async function fetchChapter(ch, delay) {
       reviews.push(...list)
       if (list.length < 10) break
       page++
+      // ★分页上限：服务端忽略 page 参数恒返回 10 条时防死循环
+      if (page > 100) break
       await sleep(delay)
     }
     out.push({ segmentId: seg.segmentId, reviewNum: seg.reviewNum, isHot: !!seg.isHotSegment, tsukkomi: reviews.map(simplify) })
@@ -212,7 +227,7 @@ async function workerLoop(wid, delay) {
         task.paused = false
         saveState()
         const mins = ((Date.now() - task.startTime) / 60000).toFixed(1)
-        log(`✅ 全部完成！共 ${task.completed} 章，用时 ${mins} 分钟`)
+        log(`✅ 全部完成！共 ${task.completed} 章（失败 ${task.failed} 章），用时 ${mins} 分钟`)
       }
       break
     }
@@ -228,8 +243,19 @@ async function workerLoop(wid, delay) {
       log(`[w${wid}] #${ch.chapter_index} ${ch.chapter_title} 段=${data.segments.length} 段评=${t} ✓`)
       saveState()
     } catch (e) {
-      log(`[w${wid}] #${ch.chapter_index} ${ch.chapter_title} FAIL: ${String(e.message || e).slice(0, 140)}`)
-      q.forEach(item => { if (item.ch.chapter_index === ch.chapter_index) item.done = false })
+      // ★attempts 上限：连续失败 3 次标记失败跳过（防 WAF 验证不过时任务死循环永不结束）
+      const item = q.find(it => it.ch.chapter_index === ch.chapter_index)
+      if (item) {
+        item.attempts = (item.attempts || 0) + 1
+        if (item.attempts >= 3) {
+          item.done = true
+          task.failed++
+          log(`[w${wid}] #${ch.chapter_index} ${ch.chapter_title} 连续失败 ${item.attempts} 次，标记失败跳过: ${String(e.message || e).slice(0, 140)}`)
+        } else {
+          item.done = false
+          log(`[w${wid}] #${ch.chapter_index} ${ch.chapter_title} FAIL(第${item.attempts}/3次): ${String(e.message || e).slice(0, 140)}`)
+        }
+      }
     }
     task.current = null
   }
@@ -254,7 +280,8 @@ async function readBody(req) {
 }
 
 const server = http.createServer(async (req, res) => {
-  const url = new URL(req.url, 'http://x')
+  let url
+  try { url = new URL(req.url, 'http://x') } catch { return json(res, 400, { error: 'bad request' }) }
   const p = url.pathname
   try {
     if (req.method === 'GET' && p === '/') return res.end(PAGE_HTML)
@@ -291,13 +318,23 @@ const server = http.createServer(async (req, res) => {
       if (task && task.running) return json(res, 400, { error: '任务已在运行' })
       const { book_id, book_name, chapter_start, chapter_end, concurrency, delay } = await readBody(req)
       if (!book_id) return json(res, 400, { error: '缺 book_id' })
+      // ★路径穿越防护：book_id 必须是纯数字
+      if (!/^\d+$/.test(String(book_id))) return json(res, 400, { error: 'book_id 必须是纯数字' })
+      // ★stop 后立即 start：等旧 worker 全部退出再建新任务（防旧 worker 污染新任务）
+      if (task && task.activeWorkers > 0) {
+        let waited = 0
+        while (task.activeWorkers > 0 && waited < 5000) { await sleep(100); waited += 100 }
+      }
       const cdpSt = await ensureCdp()
       if (!cdpSt.ok) return json(res, 400, { error: cdpSt.error })
       const outDir = path.join(DATA_ROOT, String(book_id), 'tsukkomi')
       fs.mkdirSync(outDir, { recursive: true })
       const cacheFile = path.join(DATA_ROOT, String(book_id), '_chapters.json')
       let chapters = []
-      if (fs.existsSync(cacheFile)) chapters = JSON.parse(fs.readFileSync(cacheFile, 'utf8'))
+      // ★缓存 TTL 1 天（书更新后不永远用旧目录）
+      let cacheAge = Infinity
+      try { cacheAge = Date.now() - fs.statSync(cacheFile).mtimeMs } catch { /* 不存在 */ }
+      if (fs.existsSync(cacheFile) && cacheAge < 24 * 3600 * 1000) chapters = JSON.parse(fs.readFileSync(cacheFile, 'utf8'))
       if (!chapters.length) {
         const cat = await getCatalogByNav(String(book_id))
         chapters = cat.chapters
@@ -306,10 +343,15 @@ const server = http.createServer(async (req, res) => {
       let list = chapters
       const cs = Number(chapter_start || 1), ce = Number(chapter_end || Infinity)
       if (cs > 1 || isFinite(ce)) list = list.filter(c => c.chapter_index >= cs && c.chapter_index <= ce)
+      // 断点续传：★核对文件真的存在（手删某章后必须补抓）
       let doneSet = new Set()
       const stFile = path.join(outDir, '_state.json')
       if (fs.existsSync(stFile)) doneSet = new Set(JSON.parse(fs.readFileSync(stFile, 'utf8')).done || [])
-      const queue = list.map(ch => ({ ch, done: doneSet.has(ch.chapter_index) }))
+      for (const idx of [...doneSet]) {
+        const f = path.join(outDir, `${String(idx).padStart(4, '0')}.json`)
+        if (!fs.existsSync(f)) doneSet.delete(idx)
+      }
+      const queue = list.map(ch => ({ ch, done: doneSet.has(ch.chapter_index), attempts: 0 }))
       const todoCount = queue.filter(q => !q.done).length
       if (!todoCount) return json(res, 200, { note: '无新章节（全部已抓）', total: list.length })
       task = {
@@ -319,7 +361,8 @@ const server = http.createServer(async (req, res) => {
         doneSet, doneOrder: [...doneSet], completed: doneSet.size,
         failed: 0, todoCount,
         concurrency: Math.max(1, Math.min(8, Number(concurrency) || 3)),
-        delay: Math.max(50, Number(delay) || 300),
+        // ★delay=0 合法（不等待），不能被 `0 || 300` 吞
+        delay: Number.isFinite(Number(delay)) ? Math.max(0, Number(delay)) : 300,
         startTime: Date.now(), current: null,
         activeWorkers: 0,
       }
@@ -341,7 +384,8 @@ const server = http.createServer(async (req, res) => {
   }
 })
 
-server.listen(PORT, () => {
+// ★只绑定 127.0.0.1：面板无鉴权且控制浏览器标签页，绝不能暴露到局域网
+server.listen(PORT, '127.0.0.1', () => {
   console.log(`\n  起点本章说段评可视化爬虫面板已启动`)
   console.log(`  打开 http://127.0.0.1:${PORT}\n`)
 })

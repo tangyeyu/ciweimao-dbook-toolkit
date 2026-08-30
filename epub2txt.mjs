@@ -37,15 +37,47 @@ fs.mkdirSync(extractDir, { recursive: true });
 console.log('解压 EPUB...');
 extractAll(epubPath, extractDir);
 
-// 读 toc.ncx
-const ncx = fs.readFileSync(path.join(extractDir, 'toc.ncx'), 'utf8');
+// 读 toc.ncx（★标准 EPUB 由 META-INF/container.xml 指定 OPF，toc.ncx 常在 OEBPS/ 子目录，
+//   不能假设在解压根目录；解压时路径已拍平为 __ 连接）
+function findNcx() {
+  // 1. container.xml → OPF 路径
+  const containerFile = path.join(extractDir, 'META-INF__container.xml');
+  let opfRel = null
+  if (fs.existsSync(containerFile)) {
+    const c = fs.readFileSync(containerFile, 'utf8')
+    const m = c.match(/full-path="([^"]+)"/i)
+    if (m) opfRel = m[1]
+  }
+  // 2. OPF → manifest 里的 ncx（或 spine toc 属性）
+  if (opfRel) {
+    const opfFile = path.join(extractDir, opfRel.replace(/[/\\]/g, '__'))
+    if (fs.existsSync(opfFile)) {
+      const o = fs.readFileSync(opfFile, 'utf8')
+      const m = o.match(/<item[^>]*media-type="application\/x-dtbncx\+xml"[^>]*href="([^"]+)"/i)
+      if (m) return decodeURIComponent(m[1])
+      const s = o.match(/<spine[^>]*toc="([^"]+)"/i)
+      if (s) {
+        const item = o.match(new RegExp(`<item[^>]*id="[^"]*${s[1]}[^"]*"[^>]*href="([^"]+)"`))
+        if (item) return decodeURIComponent(item[1])
+      }
+    }
+  }
+  // 3. 兜底：拍平目录里找名字含 toc.ncx 的文件
+  const hit = fs.readdirSync(extractDir).find(f => f.toLowerCase().includes('toc.ncx'))
+  if (hit) return hit.replace(/__/g, '/')
+  return 'toc.ncx'
+}
+const ncxRel = findNcx()
+const ncxFile = path.join(extractDir, ncxRel.replace(/[/\\]/g, '__'))
+const ncx = fs.readFileSync(ncxFile, 'utf8')
 const navPoints = [...ncx.matchAll(/<navPoint[^>]*>[\s\S]*?<text>\s*([\s\S]*?)\s*<\/text>[\s\S]*?<content[^>]*src="([^"]*)"/g)]
   .map(m => ({ title: m[1].replace(/<[^>]+>/g, '').replace(/&amp;/g, '&').trim(), src: m[2] }));
 
 // 过滤：跳过封面/简介/无意义标题；正文从「第一章」开始
 const skipTitles = new Set(['封面', '目录', '前言', '后记', '封底', '正文', '简介', '楔子', '序章']);
 const allNav = navPoints.filter(n => !skipTitles.has(n.title) && n.title.length > 0);
-let startIdx = allNav.findIndex(n => /第[一二三四五六七八九十百千]+章/.test(n.title));
+// ★兼容阿拉伯数字章号（第1章/第100章）
+let startIdx = allNav.findIndex(n => /第[\d一二三四五六七八九十百千]+章/.test(n.title));
 if (startIdx === -1) startIdx = 0;
 const chapters = allNav.slice(startIdx);
 
@@ -66,8 +98,10 @@ function htmlToText(html) {
   t = t.replace(/<img[^>]*>/gi, '[图]');
   // 去剩余标签
   t = t.replace(/<[^>]+>/g, '');
-  // 实体
-  t = t.replace(/&nbsp;/gi, ' ').replace(/&amp;/gi, '&').replace(/&lt;/gi, '<').replace(/&gt;/gi, '>').replace(/&quot;/gi, '"').replace(/&#39;/gi, "'").replace(/&ldquo;/gi, '“').replace(/&rdquo;/gi, '”').replace(/&hellip;/gi, '…');
+  // 实体（★数字实体须在 &amp; 之前处理，否则 &#8212; 被先替换成 &#8212; 的字面 & 序列）
+  t = t.replace(/&#x([0-9a-fA-F]+);/g, (_, h) => String.fromCodePoint(parseInt(h, 16)))
+     .replace(/&#(\d+);/g, (_, d) => String.fromCodePoint(parseInt(d, 10)))
+     .replace(/&nbsp;/gi, ' ').replace(/&amp;/gi, '&').replace(/&lt;/gi, '<').replace(/&gt;/gi, '>').replace(/&quot;/gi, '"').replace(/&#39;/gi, "'").replace(/&ldquo;/gi, '“').replace(/&rdquo;/gi, '”').replace(/&hellip;/gi, '…');
   // 清理空行
   t = t.split('\n').map(l => l.trim()).filter(l => l.length > 0).join('\n');
   return t.trim();
@@ -76,9 +110,17 @@ function htmlToText(html) {
 // 逐个章节提取
 const fileCache = new Map();
 function getFile(src) {
-  const base = src.split('#')[0];
+  // ★src 可能带百分号编码（中文/空格文件名），先解码；去掉 #锚点
+  const base = decodeURIComponent(src.split('#')[0]);
   if (fileCache.has(base)) return fileCache.get(base);
-  const f = path.join(extractDir, base.replace(/[/\\]/g, '__'));
+  let f = path.join(extractDir, base.replace(/[/\\]/g, '__'));
+  if (!fs.existsSync(f)) {
+    // 相对 OPF 目录的路径（如 OPF 在 OEBPS/ 时 src="ch1.html" 实际是 OEBPS/ch1.html）：
+    // 兜底找拍平后 basename 匹配的文件
+    const bname = base.replace(/[/\\]/g, '__').split('__').pop();
+    const hit = fs.readdirSync(extractDir).find(x => x.split('__').pop() === bname);
+    if (hit) f = path.join(extractDir, hit);
+  }
   let content = '';
   if (fs.existsSync(f)) content = fs.readFileSync(f, 'utf8');
   fileCache.set(base, content);

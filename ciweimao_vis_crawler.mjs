@@ -6,6 +6,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import http from 'node:http'
 import { createHash, createHmac, createDecipheriv, createCipheriv, publicEncrypt, constants, randomBytes } from 'node:crypto'
+import { fileURLToPath } from 'node:url'
 
 const APP_VERSION = '2.9.365'
 const DEVICE_TOKEN = 'ciweimao_'
@@ -24,7 +25,8 @@ tQIDAQAB
 const UA = 'Android  com.kuangxiangciweimao.novel.c  2.9.365, Xiaomi, 24030PN60G, 34, 14'
 
 // 数据/令牌路径：相对脚本所在目录，随仓库一起走（可用环境变量覆盖）
-const _here = path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'))
+// ★fileURLToPath 正确处理含空格/中文的路径（pathname 会被百分号编码）
+const _here = path.dirname(fileURLToPath(import.meta.url))
 const DATA_ROOT = process.env.CIWEMAO_DATA || path.join(_here, 'ciweimao_data')
 const TOKEN_FILE = process.env.CIWEMAO_TOKEN || path.join(_here, '_ciweimao_app_token.json')
 const PORT = Number(process.argv[2] || 8788)
@@ -104,8 +106,16 @@ async function apiPost(pathname, params, opts = {}) {
           'Host': new URL(getHost()).host,
         },
         body: body.toString(),
+        // ★超时：悬挂时快速失败而不是永久卡死（stop 也能生效）
+        signal: AbortSignal.timeout(20000),
       })
-      return decryptResponse(await res.text())
+      const r = decryptResponse(await res.text())
+      // ★校验响应 code：错误码（登录过期 300xxx、版本墙 200xxx、章节 400xxx）直接抛错，
+      //   避免上层把错误当「空章节」静默标记完成丢数据
+      if (r.code !== 100000) {
+        throw new Error(`API ${pathname} code=${r.code} ${(r.error?.msg || r.tip || '').slice(0, 80)}`)
+      }
+      return r
     } catch (e) {
       if (i === retries - 1) throw e
       await sleep(300 * (i + 1))
@@ -194,7 +204,7 @@ async function workerLoop(wid, delay) {
         task.paused = false
         saveState()
         const mins = ((Date.now() - task.startTime) / 60000).toFixed(1)
-        log(`✅ 全部完成！共 ${task.completed} 章，用时 ${mins} 分钟`)
+        log(`✅ 全部完成！共 ${task.completed} 章（失败 ${task.failed} 章），用时 ${mins} 分钟`)
       }
       break
     }
@@ -210,9 +220,19 @@ async function workerLoop(wid, delay) {
       log(`[w${wid}] #${ch.chapter_index} ${ch.chapter_title} 段=${data.paragraphs.length} 吐槽=${t} ✓`)
       saveState()
     } catch (e) {
-      log(`[w${wid}] #${ch.chapter_index} ${ch.chapter_title} FAIL: ${String(e.message || e).slice(0, 140)}`)
-      // 失败不计数，重试由下一次轮询自然完成（done 标记已置，需回滚）
-      q.forEach(item => { if (item.ch.chapter_index === ch.chapter_index) item.done = false })
+      // ★attempts 上限：同一章节连续失败 3 次标记 failed 跳过（防永久失败章节死循环永不完成）
+      const item = q.find(it => it.ch.chapter_index === ch.chapter_index)
+      if (item) {
+        item.attempts = (item.attempts || 0) + 1
+        if (item.attempts >= 3) {
+          item.done = true // 放弃该章
+          task.failed++
+          log(`[w${wid}] #${ch.chapter_index} ${ch.chapter_title} 连续失败 ${item.attempts} 次，标记失败跳过: ${String(e.message || e).slice(0, 140)}`)
+        } else {
+          item.done = false // 回滚，下轮重试
+          log(`[w${wid}] #${ch.chapter_index} ${ch.chapter_title} FAIL(第${item.attempts}/3次): ${String(e.message || e).slice(0, 140)}`)
+        }
+      }
     }
     task.current = null
   }
@@ -237,7 +257,8 @@ async function readBody(req) {
 }
 
 const server = http.createServer(async (req, res) => {
-  const url = new URL(req.url, 'http://x')
+  let url
+  try { url = new URL(req.url, 'http://x') } catch { return json(res, 400, { error: 'bad request' }) }
   const p = url.pathname
   try {
     if (req.method === 'GET' && p === '/') return res.end(PAGE_HTML)
@@ -277,12 +298,23 @@ const server = http.createServer(async (req, res) => {
       if (task && task.running) return json(res, 400, { error: '任务已在运行' })
       const { book_id, book_name, division_id, division_name, chapter_start, chapter_end, concurrency, delay } = await readBody(req)
       if (!book_id || !division_id) return json(res, 400, { error: '缺 book_id/division_id' })
+      // ★路径穿越防护：book_id/division_id 必须是纯数字，否则可逃逸 DATA_ROOT 任意写文件
+      if (!/^\d+$/.test(String(book_id)) || !/^\d+$/.test(String(division_id))) {
+        return json(res, 400, { error: 'book_id/division_id 必须是纯数字' })
+      }
+      // ★stop 后立即 start：等旧 worker 全部退出再建新任务，防旧 worker 污染新任务目录/计数
+      if (task && task.activeWorkers > 0) {
+        let waited = 0
+        while (task.activeWorkers > 0 && waited < 5000) { await sleep(100); waited += 100 }
+      }
       const outDir = path.join(DATA_ROOT, String(book_id), String(division_id), 'tsukkomi')
       fs.mkdirSync(outDir, { recursive: true })
-      // 章节列表（缓存）
+      // 章节列表（缓存，TTL 1 天——防书更新后永远用旧目录）
       const cacheFile = path.join(DATA_ROOT, String(book_id), String(division_id), '_chapters.json')
       let chapters = []
-      if (fs.existsSync(cacheFile)) chapters = JSON.parse(fs.readFileSync(cacheFile, 'utf8'))
+      let cacheAge = Infinity
+      try { cacheAge = Date.now() - fs.statSync(cacheFile).mtimeMs } catch { /* 不存在 */ }
+      if (fs.existsSync(cacheFile) && cacheAge < 24 * 3600 * 1000) chapters = JSON.parse(fs.readFileSync(cacheFile, 'utf8'))
       if (!chapters.length) {
         const ch = await apiPost('/chapter/get_updated_chapter_by_division_id', { division_id: String(division_id) })
         chapters = ch.data?.chapter_list || []
@@ -293,11 +325,15 @@ const server = http.createServer(async (req, res) => {
       let list = chapters
       const cs = Number(chapter_start || 1), ce = Number(chapter_end || Infinity)
       if (cs > 1 || isFinite(ce)) list = list.filter(c => c.chapter_index >= cs && c.chapter_index <= ce)
-      // 断点续传
+      // 断点续传：★核对文件真的存在（用户手删过某章 JSON 后必须补抓）
       let doneSet = new Set()
       const stFile = path.join(outDir, '_state.json')
       if (fs.existsSync(stFile)) doneSet = new Set(JSON.parse(fs.readFileSync(stFile, 'utf8')).done || [])
-      const queue = list.map(ch => ({ ch, done: doneSet.has(ch.chapter_index) }))
+      for (const idx of [...doneSet]) {
+        const f = path.join(outDir, `${String(idx).padStart(4, '0')}.json`)
+        if (!fs.existsSync(f)) doneSet.delete(idx)
+      }
+      const queue = list.map(ch => ({ ch, done: doneSet.has(ch.chapter_index), attempts: 0 }))
       const todoCount = queue.filter(q => !q.done).length
       if (!todoCount) return json(res, 200, { note: '无新章节（全部已抓）', total: list.length })
       task = {
@@ -308,7 +344,8 @@ const server = http.createServer(async (req, res) => {
         doneSet, doneOrder: [...doneSet], completed: doneSet.size,
         failed: 0, todoCount,
         concurrency: Math.max(1, Math.min(8, Number(concurrency) || 4)),
-        delay: Math.max(0, Number(delay) || 200),
+        // ★delay=0 是合法值（不等待），不能被 `0 || 200` 吞成 200
+        delay: Number.isFinite(Number(delay)) ? Math.max(0, Number(delay)) : 200,
         startTime: Date.now(), current: null,
         activeWorkers: 0,
       }
@@ -366,7 +403,8 @@ const server = http.createServer(async (req, res) => {
   }
 })
 
-server.listen(PORT, () => {
+// ★只绑定 127.0.0.1：面板无鉴权且可触发短信/登录，绝不能暴露到局域网
+server.listen(PORT, '127.0.0.1', () => {
   console.log(`\n  刺猬猫段评可视化爬虫面板已启动`)
   console.log(`  打开 http://127.0.0.1:${PORT}\n`)
 })

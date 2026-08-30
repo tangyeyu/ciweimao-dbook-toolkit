@@ -95,12 +95,15 @@ async function getCatalog(cdp, bookId) {
       seen.add(key);
       const li = a.closest('li') || a.parentElement;
       const txt = (a.textContent || '').trim();
+      // ★统一 schema：与 vis 面板一致（{book_id, chapter_id, chapter_index, chapter_title, is_vip}），
+      //   避免两工具写同一 _chapters.json 互相覆盖导致 undefined.json
       out.push({
-        bookId: m[1],
-        chapterId: m[2],
-        title: txt.slice(0, 80),
+        book_id: m[1],
+        chapter_id: m[2],
+        chapter_index: out.length + 1,
+        chapter_title: txt.slice(0, 80),
         // 付费标记：li 里 span.vip / i.vip / span 含 "VIP"
-        isVip: li ? /vip/i.test(li.className || '') || /vip/i.test(li.innerHTML || '').toString() : false
+        is_vip: li ? /vip/i.test(li.className || '') || /vip/i.test(li.innerHTML || '').toString() : false
       });
     }
     // 书名
@@ -140,6 +143,8 @@ async function getReviews(cdp, bookId, chapterId, segmentId) {
     all.push(...list);
     if (list.length < 10) break;
     page++;
+    // ★分页上限：服务端忽略 page 恒返回 10 条时防死循环
+    if (page > 100) break;
     await new Promise(r => setTimeout(r, 150));
   }
   return all;
@@ -205,7 +210,7 @@ async function main() {
   // 范围过滤
   const idxList = chapters.map((c, i) => i);
   const target = chRange ? idxList.filter(i => i + 1 >= chRange[0] && i + 1 <= chRange[1]) : idxList;
-  console.log(`待抓 ${target.length} 章 (${chapters[target[0]]?.chapterId} ~ ${chapters[target[target.length-1]]?.chapterId})`);
+  console.log(`待抓 ${target.length} 章 (${chapters[target[0]]?.chapter_id} ~ ${chapters[target[target.length-1]]?.chapter_id})`);
 
   // 断点续传
   const stateFile = join(outDir, '_state.json');
@@ -223,13 +228,13 @@ async function main() {
     while (queue.length) {
       const i = queue.shift();
       const ch = chapters[i];
-      log(`[${i + 1}/${chapters.length}] ${ch.title || ch.chapterId} 开始`);
+      log(`[${i + 1}/${chapters.length}] ${ch.chapter_title || ch.chapter_id} 开始`);
       try {
-        const sum = await getSegmentSummary(cdp, bookId, ch.chapterId);
+        const sum = await getSegmentSummary(cdp, bookId, ch.chapter_id);
         const segments = sum.list || [];
-        const out = { bookId, chapterId: ch.chapterId, title: ch.title, segments: [] };
+        const out = { bookId, chapterId: ch.chapter_id, title: ch.chapter_title, segments: [] };
         for (const seg of segments) {
-          const reviews = await getReviews(cdp, bookId, ch.chapterId, seg.segmentId);
+          const reviews = await getReviews(cdp, bookId, ch.chapter_id, seg.segmentId);
           out.segments.push({
             segmentId: seg.segmentId,
             reviewNum: seg.reviewNum,
@@ -238,7 +243,8 @@ async function main() {
           });
           await new Promise(r => setTimeout(r, delay));
         }
-        writeFileSync(join(outDir, 'tsukkomi', String(i + 1).padStart(4, '0') + '.json'), JSON.stringify(out));
+        // ★文件名与 vis 面板一致：chapter_index 补零（CLI 与面板可混用同一书的数据）
+        writeFileSync(join(outDir, 'tsukkomi', String(ch.chapter_index).padStart(4, '0') + '.json'), JSON.stringify(out));
         done.push(i);
         writeFileSync(stateFile, JSON.stringify(done));
         const total = out.segments.reduce((a, s) => a + s.tsukkomi.length, 0);
