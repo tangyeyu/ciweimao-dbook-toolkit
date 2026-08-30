@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>阅读</title>
+<style>
+* { box-sizing:border-box; margin:0; padding:0; -webkit-tap-highlight-color:transparent; }
+:root { --bg:#13151a; --card:#1b1e25; --fg:#b9bec9; --dim:#767c8a; --acc:#e8a33d; --line:#252a33; }
+body.light { --bg:#f6f2e9; --card:#fffcf5; --fg:#3a372e; --dim:#8f887a; --line:#e5deca; }
+body { background:var(--bg); color:var(--fg); font:17px/1.78 "Microsoft YaHei",sans-serif; transition:background .3s,color .3s; }
+.topbar { position:sticky; top:0; z-index:10; background:var(--bg); border-bottom:1px solid var(--line); display:flex; align-items:center; padding:11px 14px; gap:6px; }
+.topbar .back { font-size:20px; cursor:pointer; padding:2px 8px; }
+.topbar .t { flex:1; text-align:center; font-size:14px; color:var(--dim); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.topbar .icon { font-size:16px; cursor:pointer; padding:2px 6px; user-select:none; }
+#pages { position:relative; max-width:520px; margin:0 auto; padding:0; }
+.page { position:absolute; top:0; left:0; right:0; padding:18px 24px 22px; overflow:hidden; visibility:hidden; }
+.page.active { visibility:visible; }
+.pline { line-height:1.78; text-align:justify; text-justify:inter-ideograph; word-break:break-word; }
+.pline.first { text-indent:2em; }
+.pline.last { margin-bottom:.9em; }
+.pline.title { text-align:center; text-indent:0; font-size:20px !important; font-weight:700; letter-spacing:.5px; margin-bottom:1.2em; }
+.badge { display:inline-block; background:var(--line); color:var(--acc); font-size:11px; font-weight:600; padding:1px 7px; border-radius:10px; vertical-align:2px; margin-left:8px; cursor:pointer; user-select:none; border:none; }
+.badge:active { transform:scale(.92); }
+#meas { position:absolute; left:-9999px; top:0; width:520px; visibility:hidden; }
+.chapters { padding:12px 20px 40px; max-width:520px; margin:0 auto; }
+.chapters h2 { font-size:16px; color:var(--dim); margin:16px 4px 8px; font-weight:600; }
+.ch-item { padding:13px 8px; border-bottom:1px solid var(--line); cursor:pointer; font-size:16px; display:flex; justify-content:space-between; align-items:center; }
+.ch-item .cnt { font-size:11px; color:var(--dim); }
+.ch-item.done { color:var(--dim); }
+/* bottom sheet */
+#mask { position:fixed; inset:0; background:rgba(0,0,0,.55); z-index:20; display:none; }
+#sheet { position:fixed; left:0; right:0; bottom:0; z-index:21; background:var(--card); border-radius:16px 16px 0 0; max-height:68vh; display:none; flex-direction:column; transform:translateY(100%); transition:transform .25s ease; }
+#sheet.open { transform:translateY(0); }
+#sheet .hd { padding:14px 16px; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; align-items:center; font-size:14px; color:var(--dim); }
+#sheet .hd b { color:var(--acc); font-size:15px; }
+#sheet .close { cursor:pointer; font-size:18px; padding:0 4px; }
+#tkList { overflow-y:auto; padding:6px 0 24px; }
+.tk { padding:10px 16px; border-bottom:1px solid var(--line); }
+.tk .u { font-size:12px; color:var(--acc); margin-bottom:2px; display:flex; justify-content:space-between; }
+.tk .u .ip { color:var(--dim); font-size:11px; }
+.tk .c { font-size:14px; line-height:1.6; word-break:break-all; }
+.tk .f { font-size:11px; color:var(--dim); margin-top:4px; }
+.tk .lou { font-size:10px; color:var(--dim); background:var(--line); border-radius:4px; padding:0 5px; }
+.tk .reply { margin-top:6px; padding:6px 10px; background:var(--bg); border-radius:8px; font-size:12.5px; color:var(--fg); }
+.tk .reply .ru { color:var(--acc); font-size:11px; }
+#nav { position:fixed; bottom:0; left:0; right:0; z-index:10; display:flex; background:var(--bg); border-top:1px solid var(--line); }
+#nav button { flex:1; padding:13px; background:none; border:none; color:var(--fg); font-size:14px; cursor:pointer; }
+#nav button:disabled { color:var(--line); }
+#pager { position:fixed; bottom:0; left:0; right:0; z-index:10; display:flex; align-items:center; justify-content:center; gap:20px; background:var(--bg); border-top:1px solid var(--line); padding:9px 0; font-size:13px; color:var(--dim); }
+#pager .pg { min-width:70px; text-align:center; font-variant-numeric:tabular-nums; font-size:13px; letter-spacing:.3px; }
+#pager button { background:none; border:none; color:var(--fg); font-size:15px; cursor:pointer; padding:4px 10px; }
+#pager button:disabled { color:var(--line); }
+#loading { text-align:center; padding:80px 20px; color:var(--dim); font-size:14px; }
+</style>
+</head>
+<body>
+<div class="topbar">
+  <span class="back" onclick="goBack()">‹</span>
+  <span class="t" id="chapterTitle">…</span>
+  <span class="icon" id="btnList" title="目录">☰</span>
+  <span class="icon" id="btnFont" title="字号">A</span>
+  <span class="icon" id="btnTheme" title="主题">🌙</span>
+</div>
+<div id="pages"></div>
+<div id="meas"></div>
+<div id="loading">加载中…</div>
+
+<div class="chapters" id="chapters" style="display:none"></div>
+
+<div id="pager">
+  <button id="pPrev">‹ 上页</button>
+  <span class="pg" id="pgInfo">1 / 1</span>
+  <button id="pNext">下页 ›</button>
+</div>
+
+<div id="mask"></div>
+<div id="sheet">
+  <div class="hd"><span>段评 <b id="tkCount">0</b></span><span class="close" onclick="closeSheet()">✕</span></div>
+  <div id="tkList"></div>
+</div>
+
+<script>
+var params = new URLSearchParams(location.search)
+var bookId = params.get('book') || 'duoluoxi'
+var src = params.get('src') || 'builtin'
+// App 内走 JS 桥 AppBridge.readFile（最稳，不依赖 fetch/CORS）；浏览器预览走相对路径
+var USE_BRIDGE = typeof AppBridge !== 'undefined' && AppBridge.readFile
+var BASE = USE_BRIDGE ? '' : '../books/' + bookId + '/'
+var meta = null, current = 1, total = 0, fs = 17
+var theme = localStorage.getItem('theme') || 'dark'
+
+document.body.className = theme === 'light' ? 'light' : ''
+document.getElementById('btnTheme').textContent = theme === 'light' ? '☀️' : '🌙'
+
+function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;') }
+function fmtTime(ts) {
+  if (!ts) return ''
+  var s = String(ts)
+  if (/^\d{4}-\d{2}-\d{2}/.test(s)) return s.slice(0,16)
+  if (/^\d{10}$/.test(s)) { var d = new Date(parseInt(s)*1000); return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0')+' '+String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0') }
+  return s
+}
+var EMOJI_MAP = { '#(可爱)':'😊','#(笑)':'😄','#(泪)':'😭','#(怒)':'😠','#(汗)':'😅','#(囧)':'😳','#(无语)':'😑','#(滑稽)':'😏','#(惊喜)':'😮','#(心)':'❤️' }
+function fmtEmoji(s) { if(!s)return s; var o=s; for(var k in EMOJI_MAP) o=o.split(k).join(EMOJI_MAP[k]); return o }
+
+function get(path) {
+  if (USE_BRIDGE) {
+    return new Promise(function(resolve, reject) {
+      var t = AppBridge.readFile(bookId, path)
+      if (t == null) reject(new Error('文件不存在: ' + path))
+      else resolve(t)
+    })
+  }
+  return fetch(BASE + path).then(function(r){ if(!r.ok) throw new Error('404'); return r.text() })
+}
+
+async function init() {
+  try {
+    var m = JSON.parse(await get('meta.json'))
+    meta = m
+    total = m.chapter_count || 0
+    document.getElementById('chapterTitle').textContent = m.book_name || bookId
+    // 进度：新格式 "章节:页码"，旧格式纯章节号 → 页码 1
+    try {
+      var pv = localStorage.getItem('prog:' + bookId) || '1'
+      var parts = String(pv).split(':')
+      current = parseInt(parts[0], 10) || 1
+      var savedPage = parts.length > 1 ? (parseInt(parts[1], 10) || 1) : 1
+    } catch(e) { current = 1; savedPage = 1 }
+    if (current < 1) current = 1
+    if (current > total) current = total
+    renderChapters()
+    loadChapter(current, savedPage)
+  } catch(e) {
+    document.getElementById('loading').textContent = '加载失败：' + e.message
+  }
+}
+
+function renderChapters() {
+  var c = document.getElementById('chapters')
+  var h = '<h2>' + (meta.book_name||'') + ' · 目录</h2>'
+  for (var i = 1; i <= total; i++) {
+    var t = meta.titles && meta.titles[String(i)] ? meta.titles[String(i)] : '第' + i + '章'
+    var cnt = meta.chapter_tsukkomi && meta.chapter_tsukkomi[String(i)] ? meta.chapter_tsukkomi[String(i)] : null
+    var done = 0; try { done = parseInt(localStorage.getItem('prog:'+bookId)||'0',10)||0 } catch(e){}
+    h += '<div class="ch-item' + (i <= done ? ' done' : '') + '" data-i="' + i + '">'
+      + '<span>' + esc(t) + '</span>'
+      + (cnt ? '<span class="cnt">💬' + cnt + '</span>' : '')
+      + '</div>'
+  }
+  c.innerHTML = h
+  c.querySelectorAll('.ch-item').forEach(function(el) {
+    el.onclick = function(){ current = parseInt(el.dataset.i,10); showChapters(false); loadChapter(current, 1) }
+  })
+}
+function showChapters(v) {
+  document.getElementById('chapters').style.display = v ? 'block' : 'none'
+  document.getElementById('pages').style.display = v ? 'none' : 'block'
+  document.getElementById('pager').style.display = v ? 'none' : 'flex'
+  if (!v) relayout()  // 目录回来按当前字号重排
+}
+
+var tkCache = {}
+var curChapter = 1, curPage = 1, pageCount = 1
+var currentRawLines = []   // 当前章原始段落文本（重排用）
+var currentTkByPara = null // 当前章段评 map
+var pagesEl = document.getElementById('pages')
+
+// ---- 番茄式行级分页：段落按行切，行可跨页，页面被文字填满 ----
+// DOM 实测文本宽（与渲染同引擎同字体，canvas 测宽在安卓 WebView 会因字体回退偏差导致右边空）
+var _measEl = null
+function textW(s, fsPx) {
+  if (!_measEl) {
+    _measEl = document.createElement('div')
+    _measEl.style.cssText = 'position:absolute;left:-99999px;top:0;visibility:hidden;white-space:nowrap;'
+    document.body.appendChild(_measEl)
+  }
+  _measEl.innerHTML = '<span style="font-size:' + fsPx + 'px">' + esc(s) + '</span>'
+  var w = _measEl.firstElementChild.getBoundingClientRect().width
+  _measEl.innerHTML = ''
+  return w
+}
+// 从 remaining 头部切一行（不超过 maxW，英文单词整体后移）
+function takeLine(remaining, fsPx, maxW) {
+  var chars = Array.from(remaining)
+  var cur = ''
+  for (var i = 0; i < chars.length; i++) {
+    var test = cur + chars[i]
+    if (cur && textW(test, fsPx) > maxW) {
+      var m = cur.match(/[A-Za-z0-9]+$/)
+      if (m && textW(cur.slice(0, cur.length - m[0].length), fsPx) > 0) {
+        return cur.slice(0, cur.length - m[0].length)  // 尾部单词留给下一行
+      }
+      return cur
+    }
+    cur += chars[i]
+  }
+  return cur
+}
+// 把一段文本切成行：首行用 firstW（预留缩进），中间行用 restW（全宽），
+// 最后一行用 lastW（预留段评徽章位置）——只有末行窄，其余行顶满
+function splitIntoLines(text, fsPx, firstW, restW, lastW) {
+  if (!text) return ['']
+  var lines = []
+  var remaining = text
+  var isFirst = true
+  while (remaining.length) {
+    // 剩余文本放得进最后一行（按 lastW 判断）→ 收尾
+    if (textW(remaining, fsPx) <= (isFirst ? firstW : lastW)) {
+      lines.push(remaining)
+      break
+    }
+    var line = takeLine(remaining, fsPx, isFirst ? firstW : restW)
+    if (!line.length) line = remaining.slice(0, 1)  // 兜底：单字符也超宽
+    lines.push(line)
+    remaining = remaining.slice(line.length)
+    isFirst = false
+  }
+  return lines
+}
+// 重排（字号/主题/屏幕旋转后）：重新切行分页，回到当前页附近
+function relayout() {
+  if (!currentRawLines.length) return
+  var oldPage = curPage
+  pageCount = layoutPages(currentRawLines)
+  if (oldPage > pageCount) oldPage = pageCount
+  showPage(oldPage)
+  updateNavButtons()
+}
+function pageHeight() {
+  var top = document.querySelector('.topbar').getBoundingClientRect().height
+  var bot = document.getElementById('pager').getBoundingClientRect().height
+  // 减去 .page 上下内边距（18px + 22px），否则末行被 overflow:hidden 裁掉
+  return window.innerHeight - top - bot - 40
+}
+function layoutPages(rawLines) {
+  var H = pageHeight()
+  var contentW = pagesEl.clientWidth - 48  // #pages padding 24px×2
+  var lh = Math.round(fs * 1.78)          // 单行高（含行高系数）
+  var lineGap = Math.round(fs * 0.9)      // 段间距（.pline.last margin-bottom）
+  var pages = []
+  var cur = []
+  var acc = 0
+  var badgeW = 0
+  for (var i = 0; i < rawLines.length; i++) {
+    var text = rawLines[i]
+    var tks = currentTkByPara ? (currentTkByPara.get(i) || []) : []
+    var isTitle = (i === 0)
+    var fsPx = isTitle ? 20 : fs
+    var lineH = isTitle ? Math.round(20 * 1.78) : lh
+    // 首行缩进 2em 只作用于段落第一行（切行时首行窄 2 字符）；标题段不缩进
+    var firstW = contentW - (isTitle ? 0 : fs * 2)
+    var restW = contentW
+    // 段评徽章占位：只有最后一行预留（按实际文本测宽 + padding），中间行全宽顶满
+    var badgeW = tks.length ? textW('💬 ' + tks.length, 11) + 14 : 0
+    var sub = splitIntoLines(text, fsPx, firstW, restW, restW - badgeW)
+    for (var j = 0; j < sub.length; j++) {
+      var h = lineH + (j === sub.length - 1 ? lineGap : 0)
+      if (cur.length && acc + h > H) { pages.push(cur); cur = []; acc = 0 }
+      cur.push({ html: '<div class="pline' + (isTitle ? ' title' : (j === 0 ? ' first' : '')) + (j === sub.length - 1 ? ' last' : '') + '" data-para="' + i + '" style="font-size:' + fsPx + 'px">' + esc(sub[j]) + (j === sub.length - 1 && tks.length ? '<button class="badge" onclick="showTks(' + i + ',' + curChapter + ')">💬 ' + tks.length + '</button>' : '') + '</div>' })
+      acc += h
+    }
+  }
+  if (cur.length) pages.push(cur)
+  pagesEl.style.height = H + 'px'
+  pagesEl.innerHTML = pages.map(function(p, idx) {
+    return '<div class="page' + (idx === 0 ? ' active' : '') + '" data-pg="' + idx + '">' + p.map(function(x){return x.html}).join('') + '</div>'
+  }).join('')
+  return pages.length
+}
+function showPage(p) {
+  if (p < 1 || p > pageCount) return false
+  curPage = p
+  pagesEl.querySelectorAll('.page').forEach(function(el) {
+    el.classList.toggle('active', Number(el.dataset.pg) === p - 1)
+  })
+  document.getElementById('pgInfo').textContent = p + ' / ' + pageCount
+  try { localStorage.setItem('prog:' + bookId, curChapter + ':' + curPage) } catch(e){}
+  return true
+}
+
+async function loadChapter(i, toPage) {
+  curChapter = i
+  document.getElementById('loading').style.display = 'block'
+  pagesEl.innerHTML = ''
+  try {
+    var txt = await get('chapters/' + pad(i) + '.txt')
+    var lines = txt.split(/\r?\n/).map(function(l){return l.trim()}).filter(function(l){return l.length>0})
+    while (lines.length && /^(正文|序章|序言|前言|楔子|番外说明|公告)$/.test(lines[0])) lines.shift()
+    var title = lines[0] || '第' + i + '章'
+    var titleMatch = lines[0] && lines[0].match(/^(第[一二三四五六七八九十百千\d]+章.*)$/)
+    if (titleMatch) title = titleMatch[1]
+    document.getElementById('chapterTitle').textContent = title
+
+    // 段评
+    var byPara = new Map()
+    if (meta.has_tsukkomi) {
+      try {
+        var tk = JSON.parse(await get('tsukkomi/' + pad(i) + '.json'))
+        tkCache[i] = tk
+        for (var p of (tk.paragraphs || [])) byPara.set(Number(p.paragraph_index), p.tsukkomi || [])
+      } catch(e) { tkCache[i] = null }
+    }
+
+    // 缓存原始段落文本 + 段评 map，layoutPages 内按行切分（番茄式行级分页）
+    currentRawLines = lines
+    currentTkByPara = byPara
+    pageCount = layoutPages(lines)
+    document.getElementById('loading').style.display = 'none'
+    // 目标页（翻到上章末页时传 -1）
+    var target = toPage === -1 ? pageCount : (toPage || 1)
+    if (target < 1) target = 1
+    if (target > pageCount) target = pageCount
+    showPage(target)
+    // 进度
+    try { localStorage.setItem('prog:' + bookId, i + ':' + curPage) } catch(e){}
+    // 页导航按钮
+    document.getElementById('pPrev').disabled = (curPage <= 1 && i <= 1)
+    document.getElementById('pNext').disabled = (curPage >= pageCount && i >= total)
+    document.getElementById('pPrev').onclick = function(){ prevPage() }
+    document.getElementById('pNext').onclick = function(){ nextPage() }
+    document.title = title
+  } catch(e) {
+    document.getElementById('loading').textContent = '章节加载失败：' + e.message
+  }
+}
+function pad(n) { return String(n).padStart(4, '0') }
+
+// ---- 页级翻页（供按钮、点击、滑动、音量键共用）----
+function prevPage() {
+  if (curPage > 1) { showPage(curPage - 1); updateNavButtons() }
+  else if (curChapter > 1) loadChapter(curChapter - 1, -1)   // 上一章末页
+}
+function nextPage() {
+  if (curPage < pageCount) { showPage(curPage + 1); updateNavButtons() }
+  else if (curChapter < total) loadChapter(curChapter + 1, 1) // 下一章首页
+}
+function updateNavButtons() {
+  document.getElementById('pPrev').disabled = (curPage <= 1 && curChapter <= 1)
+  document.getElementById('pNext').disabled = (curPage >= pageCount && curChapter >= total)
+}
+// 音量键接口：MainActivity onKeyDown 调 window.__volPage(dir)，dir=-1 上页 / 1 下页
+window.__volPage = function(dir) {
+  if (dir < 0) prevPage()
+  else nextPage()
+  return true
+}
+
+// ---- 左右点击翻页（内容区左 1/3 上页、右 1/3 下页；避开段评徽章点击）----
+pagesEl.addEventListener('click', function(e) {
+  if (e.target.classList.contains('badge')) return  // 点段评徽章不翻页
+  var r = pagesEl.getBoundingClientRect()
+  var x = e.clientX - r.left
+  var w = r.width
+  if (x < w / 3) prevPage()
+  else if (x > w * 2 / 3) nextPage()
+})
+
+// ---- 左右滑动翻页 ----
+var touchX = 0, touchY = 0, touchT = 0
+document.addEventListener('touchstart', function(e) {
+  touchX = e.touches[0].clientX
+  touchY = e.touches[0].clientY
+  touchT = Date.now()
+}, { passive: true })
+document.addEventListener('touchend', function(e) {
+  var dx = e.changedTouches[0].clientX - touchX
+  var dy = e.changedTouches[0].clientY - touchY
+  if (Math.abs(dx) > 60 && Math.abs(dx) > Math.abs(dy) * 1.5 && Date.now() - touchT < 800) {
+    if (dx < 0) nextPage()   // 左滑 → 下页
+    else prevPage()          // 右滑 → 上页
+  }
+}, { passive: true })
+
+// ---- 段评弹层 ----
+var curPara = 0, curChap = 0
+function showTks(para, chap) {
+  curPara = para; curChap = chap
+  var tk = tkCache[chap]
+  var list = tk && tk.paragraphs ? (tk.paragraphs.find(function(p){return Number(p.paragraph_index)===para}) || {}).tsukkomi || [] : []
+  document.getElementById('tkCount').textContent = list.length
+  var h = ''
+  list.forEach(function(t) {
+    h += '<div class="tk">'
+      + '<div class="u"><span>' + esc(t.user || '匿名') + '</span><span class="ip">' + esc(t.ip || '') + (t.lou ? ' <span class="lou">' + t.lou + '楼</span>' : '') + '</span></div>'
+      + '<div class="c">' + esc(fmtEmoji(t.content || '')) + '</div>'
+      + '<div class="f">' + fmtTime(t.time) + (Number(t.like)>0 ? ' · 👍' + t.like : '') + (Number(t.reply)>0 ? ' · 💬' + t.reply : '') + '</div>'
+      + ((t.hot_reply && t.hot_reply.length) ? t.hot_reply.map(function(r){
+          return '<div class="reply"><span class="ru">' + esc(r.user||'') + '：</span>' + esc(fmtEmoji(r.content||'')) + '</div>'
+        }).join('') : '')
+      + '</div>'
+  })
+  if (!list.length) h = '<div class="tk"><div class="c" style="color:var(--dim)">这一段没有段评</div></div>'
+  document.getElementById('tkList').innerHTML = h
+  openSheet()
+}
+function openSheet(){ document.getElementById('sheet').classList.add('open'); document.getElementById('mask').style.display='block'; document.getElementById('sheet').style.display='flex' }
+function closeSheet(){ document.getElementById('sheet').classList.remove('open'); document.getElementById('mask').style.display='none'; setTimeout(function(){document.getElementById('sheet').style.display='none'},250) }
+document.getElementById('mask').onclick = closeSheet
+
+function goBack() {
+  if (history.length > 1) history.back()
+  else location.href = 'index.html'
+}
+document.getElementById('btnList').onclick = function(){ showChapters(document.getElementById('chapters').style.display !== 'block') }
+document.getElementById('btnFont').onclick = function(){
+  fs = fs === 17 ? 20 : fs === 20 ? 23 : 17
+  relayout()
+}
+document.getElementById('btnTheme').onclick = function(){
+  theme = theme === 'dark' ? 'light' : 'dark'
+  localStorage.setItem('theme', theme)
+  document.body.className = theme === 'light' ? 'light' : ''
+  this.textContent = theme === 'light' ? '☀️' : '🌙'
+}
+// 屏幕旋转/尺寸变化 → 重排
+window.addEventListener('resize', function(){ relayout() })
+
+init()
+</script>
+</body>
+</html>

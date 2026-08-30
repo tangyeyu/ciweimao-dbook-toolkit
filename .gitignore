@@ -1,0 +1,21 @@
+# 运行时数据（含登录态/抓取数据）
+ciweimao_data/
+dbook_out/
+_ciweimao_app_token.json
+_ciweimao_cookies.json
+
+# 书数据与正文（版权内容，不纳入仓库）
+book/
+book-output/
+*.dbook
+
+# Android 构建产物
+duoluoxi_app/.gradle/
+duoluoxi_app/app/build/
+duoluoxi_app/local.properties
+duoluoxi_app/*.log
+duoluoxi_app/app/src/main/assets/books/
+
+# 系统
+.DS_Store
+Thumbs.db

@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>书架</title>
+<style>
+* { box-sizing:border-box; margin:0; padding:0; -webkit-tap-highlight-color:transparent; }
+body { background:#f6f2e9; color:#3a372e; font:15px/1.6 "Microsoft YaHei",sans-serif; min-height:100vh; }
+.header { padding:20px 16px 10px; display:flex; align-items:baseline; justify-content:space-between; }
+.header h1 { font-size:22px; } .header h1 span { color:#e8a33d; }
+.header .sub { font-size:12px; color:#8f887a; }
+#shelf { padding:10px 16px 30px; display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+@media (min-width:640px){ #shelf { grid-template-columns:repeat(3,1fr); } }
+.card { background:#fffcf5; border:1px solid #e5deca; border-radius:12px; padding:14px; cursor:pointer; position:relative; overflow:hidden; box-shadow:0 1px 3px rgba(60,50,20,.06); }
+.card .cover { width:100%; aspect-ratio:3/4; background:linear-gradient(145deg,#f3ecdd,#e7dcc4); border-radius:8px; display:flex; align-items:center; justify-content:center; font-size:34px; margin-bottom:10px; }
+.card .name { font-weight:700; font-size:15px; margin-bottom:2px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; color:#2f2b22; }
+.card .meta { font-size:11px; color:#8f887a; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.card .badge { position:absolute; top:22px; right:22px; background:rgba(232,163,61,.9); color:#fff; font-size:10px; font-weight:700; padding:2px 8px; border-radius:10px; }
+.card .del { position:absolute; top:10px; right:10px; width:24px; height:24px; border-radius:50%; background:#f6ddd6; color:#c4492f; display:none; align-items:center; justify-content:center; font-size:14px; z-index:2; }
+.card .gear { position:absolute; top:10px; right:10px; width:26px; height:26px; border-radius:50%; background:#efe8d8; color:#7a7364; display:flex; align-items:center; justify-content:center; font-size:14px; z-index:2; }
+.card.editing .gear { display:none; }
+.card.editing .del { display:flex; }
+.progress { height:3px; background:#e8e0cd; border-radius:2px; margin-top:8px; overflow:hidden; }
+.progress>div { height:100%; background:#e8a33d; }
+.empty { grid-column:1/-1; text-align:center; color:#8f887a; padding:60px 20px; font-size:14px; }
+.toolbar { display:flex; gap:10px; padding:10px 16px; }
+.toolbar button { flex:1; padding:12px; border:none; border-radius:10px; font-size:15px; font-weight:700; cursor:pointer; }
+#btnImport { background:#e8a33d; color:#fff; }
+#btnEdit { background:#efe8d8; color:#3a372e; }
+/* 设置弹层 */
+#mask { position:fixed; inset:0; background:rgba(40,30,10,.45); z-index:20; display:none; }
+#setSheet { position:fixed; left:0; right:0; bottom:0; z-index:21; background:#fffcf5; border-radius:16px 16px 0 0; padding:16px 16px 30px; display:none; box-shadow:0 -4px 20px rgba(60,50,20,.15); }
+#setSheet .hd { display:flex; justify-content:space-between; align-items:center; font-size:15px; color:#8f887a; margin-bottom:14px; }
+#setSheet .hd b { color:#e8a33d; }
+#setSheet .close { cursor:pointer; font-size:18px; padding:0 4px; }
+#setSheet .row { display:flex; align-items:center; justify-content:space-between; padding:14px 4px; border-bottom:1px solid #e5deca; font-size:14px; }
+#setSheet .row .btn { background:#efe8d8; color:#3a372e; border:none; border-radius:8px; padding:8px 14px; font-size:13px; cursor:pointer; }
+#setSheet .row .btn.acc { background:#e8a33d; color:#fff; font-weight:700; }
+#setSheet .info { font-size:12px; color:#8f887a; line-height:1.8; padding:4px 4px 10px; }
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>📚 书<span>架</span></h1>
+  <div class="sub" id="ver">…</div>
+</div>
+<div class="toolbar">
+  <button id="btnImport">＋ 导入书</button>
+  <button id="btnEdit">管理</button>
+</div>
+<div id="shelf"><div class="empty">加载中…</div></div>
+
+<!-- 书设置弹层 -->
+<div id="mask"></div>
+<div id="setSheet">
+  <div class="hd"><span id="setTitle">设置</span><span class="close" onclick="closeSettings()">✕</span></div>
+  <div id="setBody"></div>
+</div>
+
+<script>
+var shelf = document.getElementById('shelf')
+var editing = false
+// 副标题显示 App 版本号（AppBridge.getVersion），无桥（浏览器预览）时显示 "preview"
+try { document.getElementById('ver').textContent = window.AppBridge ? 'v' + AppBridge.getVersion() : 'preview' } catch(e) {}
+
+function fmt(n) { return n >= 10000 ? (n/10000).toFixed(1)+'万' : String(n) }
+
+function render(books) {
+  if (!books || !books.length) {
+    shelf.innerHTML = '<div class="empty">书架空空如也<br>点「导入书」添加第一本书吧</div>'
+    return
+  }
+    var html = ''
+  books.forEach(function(b) {
+    var prog = 0
+    try { prog = parseInt(localStorage.getItem('prog:' + b.id) || '0', 10) || 0 } catch(e){}
+    var pct = b.chapter_count ? Math.min(100, Math.round(prog / b.chapter_count * 100)) : 0
+    html += '<div class="card" data-id="' + b.id + '" data-src="' + b.src + '">'
+      + '<span class="gear" title="设置" data-set="' + b.id + '">⚙</span>'
+      + '<span class="del" data-del="' + b.id + '">✕</span>'
+      + '<div class="cover">📖</div>'
+      + '<div class="name">' + esc(b.book_name || b.id) + '</div>'
+      + '<div class="meta">' + esc(b.author || '') + ' · ' + (b.chapter_count||0) + '章' + (b.has_tsukkomi ? ' · 💬' + fmt(b.tsukkomi_count||0) : '') + '</div>'
+      + (pct > 0 ? '<div class="progress"><div style="width:' + pct + '%"></div></div>' : '')
+      + (b.src === 'builtin' ? '<span class="badge">内置</span>' : '')
+      + '</div>'
+  })
+  shelf.innerHTML = html
+  shelf.querySelectorAll('.card').forEach(function(c) {
+    c.addEventListener('click', function(e) {
+      if (e.target.classList.contains('del') || e.target.classList.contains('gear')) return
+      if (editing) return
+      location.href = 'reader.html?book=' + c.dataset.id + '&src=' + c.dataset.src
+    })
+    var gear = c.querySelector('.gear')
+    if (gear) gear.addEventListener('click', function() {
+      openSettings(c.dataset.id, c.dataset.src)
+    })
+    var del = c.querySelector('.del')
+    if (del) del.addEventListener('click', function() {
+      if (confirm('删除这本书（仅导入的，内置书不可删）？')) {
+        if (AppBridge) AppBridge.removeBook(del.dataset.del)
+        loadBooks()
+      }
+    })
+  })
+}
+function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;') }
+
+function loadBooks() {
+  if (window.AppBridge) {
+    try {
+      var list = JSON.parse(AppBridge.getBooks())
+      render(list)
+      return
+    } catch(e) { /* fallthrough */ }
+  }
+  // 无桥（桌面预览）：尝试 appbook:// 读内置书
+  shelf.innerHTML = '<div class="empty">浏览器预览模式：请用 App 打开</div>'
+}
+
+document.getElementById('btnImport').onclick = function() {
+  if (window.AppBridge) { AppBridge.importDbook('book', '') }
+  else alert('请用 App 打开此页面')
+}
+document.getElementById('btnEdit').onclick = function() {
+  editing = !editing
+  this.textContent = editing ? '完成' : '管理'
+  document.querySelectorAll('.card').forEach(function(c) { c.classList.toggle('editing', editing) })
+}
+
+// ---- 书设置弹层 ----
+var currentBook = null
+function openSettings(bookId, src) {
+  currentBook = bookId
+  document.getElementById('setTitle').innerHTML = '<b>' + esc(bookId) + '</b> 设置'
+  var isBuiltin = src === 'builtin'
+  document.getElementById('setBody').innerHTML =
+      '<div class="info">' + (isBuiltin ? '内置书 · 数据随 App 附带' : '导入书 · 数据存在本机') + '</div>'
+    + '<div class="row"><span>导入段评</span><button class="btn acc" id="setImportTk">选择 .dbook 段评包</button></div>'
+    + '<div class="info">段评包 = 只含 tsukkomi 数据的 .dbook 文件（电脑端 build_dbook.mjs --tsukkomi-only 生成）。</div>'
+    + (isBuiltin ? '' : '<div class="row"><span>删除本书</span><button class="btn" id="setDel">删除</button></div>')
+  document.getElementById('setImportTk').onclick = function() {
+    if (window.AppBridge) { AppBridge.importDbook('tsukkomi', bookId); closeSettings() }
+    else alert('请用 App 打开此页面')
+  }
+  var delBtn = document.getElementById('setDel')
+  if (delBtn) delBtn.onclick = function() {
+    if (confirm('确认删除这本书？')) {
+      if (AppBridge) AppBridge.removeBook(bookId)
+      closeSettings(); loadBooks()
+    }
+  }
+  document.getElementById('mask').style.display = 'block'
+  document.getElementById('setSheet').style.display = 'block'
+}
+function closeSettings() {
+  document.getElementById('mask').style.display = 'none'
+  document.getElementById('setSheet').style.display = 'none'
+}
+
+// 导入结果回调（Java 调用）——增加 mode 参数
+window.onImportResult = function(ok, bookId, mode) {
+  if (ok) {
+    alert((mode === 'tsukkomi' ? '段评导入成功：' : '导入成功：') + bookId)
+  } else {
+    alert('导入失败：' + bookId)
+  }
+  loadBooks()
+}
+
+loadBooks()
+</script>
+</body>
+</html>

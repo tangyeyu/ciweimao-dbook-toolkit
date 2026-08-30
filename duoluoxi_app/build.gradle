@@ -1,0 +1,16 @@
+// 项目根 build.gradle
+// AGP 8.5.2 从阿里云/腾讯云镜像拉取（国内网络直连 Google Maven 慢/被墙）
+buildscript {
+    repositories {
+        maven { url 'https://maven.aliyun.com/repository/google' }
+        maven { url 'https://maven.aliyun.com/repository/gradle-plugin' }
+        maven { url 'https://maven.aliyun.com/repository/public' }
+        maven { url 'https://mirrors.cloud.tencent.com/nexus/repository/maven-public/' }
+        google()
+        mavenCentral()
+    }
+}
+
+plugins {
+    id 'com.android.application' version '8.5.2' apply false
+}
