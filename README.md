@@ -42,6 +42,7 @@
 |---|---|---|
 | `ciweimao_vis_crawler.mjs` | 刺猬猫段评可视化爬虫面板 | `http://127.0.0.1:8788` |
 | `dbook_pack_panel.mjs` | `.dbook` 可视化打包面板 | `http://127.0.0.1:8789` |
+| `段评爬虫面板.bat` / `段评打包面板.bat` | Windows 双击启动器（自动开浏览器） | 双击运行 |
 | `build_dbook.mjs` | `.dbook` 打包 CLI | 命令行 |
 | `build_dbook_from_crawler.mjs` | 爬虫数据 → `.dbook` CLI | 命令行 |
 | `epub2txt.mjs` | EPUB → 分章 TXT | 命令行 |
@@ -67,6 +68,8 @@ node ciweimao_vis_crawler.mjs
 # 浏览器打开 http://127.0.0.1:8788
 ```
 
+> Windows 用户也可以直接**双击 `段评爬虫面板.bat`**（自动启动服务并打开浏览器）。
+
 面板上：
 
 1. **登录**：输入手机号 → 点发送验证码 → 填短信验证码 → 登录（登录态存到 `_ciweimao_app_token.json`，下次自动生效）
@@ -84,6 +87,8 @@ node ciweimao_vis_crawler.mjs
 node dbook_pack_panel.mjs
 # 浏览器打开 http://127.0.0.1:8789
 ```
+
+> Windows 用户也可以直接**双击 `段评打包面板.bat`**。
 
 - 面板自动扫描已抓取的书 → 每本两个按钮：
   - **📦 打段评包**：只有段评（小，适合已导入过正文的书更新段评）
