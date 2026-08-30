@@ -1,4 +1,4 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- app_name 由 app/build.gradle 的 resValue 动态生成（段评书架 v{versionName}） -->
 <resources>
-    <string name="app_name">段评书架</string>
 </resources>

@@ -44,6 +44,7 @@ body { background:var(--bg); color:var(--fg); font:17px/1.78 "Microsoft YaHei",s
 .tk .lou { font-size:10px; color:var(--dim); background:var(--line); border-radius:4px; padding:0 5px; }
 .tk .reply { margin-top:6px; padding:6px 10px; background:var(--bg); border-radius:8px; font-size:12.5px; color:var(--fg); }
 .tk .reply .ru { color:var(--acc); font-size:11px; }
+.tk .reply .rt { float:right; font-size:10px; color:var(--dim); margin-left:8px; }
 #nav { position:fixed; bottom:0; left:0; right:0; z-index:10; display:flex; background:var(--bg); border-top:1px solid var(--line); }
 #nav button { flex:1; padding:13px; background:none; border:none; color:var(--fg); font-size:14px; cursor:pointer; }
 #nav button:disabled { color:var(--line); }
@@ -87,7 +88,7 @@ var src = params.get('src') || 'builtin'
 // App 内走 JS 桥 AppBridge.readFile（最稳，不依赖 fetch/CORS）；浏览器预览走相对路径
 var USE_BRIDGE = typeof AppBridge !== 'undefined' && AppBridge.readFile
 var BASE = USE_BRIDGE ? '' : '../books/' + bookId + '/'
-var meta = null, current = 1, total = 0, fs = 17
+var meta = null, current = 1, total = 0, fs = (function(){ try { var v = parseInt(localStorage.getItem('fs'), 10); return (v === 17 || v === 20 || v === 23) ? v : 17 } catch(e){ return 17 } })()
 var theme = localStorage.getItem('theme') || 'dark'
 
 document.body.className = theme === 'light' ? 'light' : ''
@@ -159,6 +160,15 @@ function showChapters(v) {
   document.getElementById('pages').style.display = v ? 'none' : 'block'
   document.getElementById('pager').style.display = v ? 'none' : 'flex'
   if (!v) relayout()  // 目录回来按当前字号重排
+  else {
+    // 打开目录直接定位到当前章节，不用从第一章重头翻（目录是 body 滚动，滚 window）
+    var item = document.querySelector('.ch-item[data-i="' + current + '"]')
+    if (item) {
+      var itemTop = item.getBoundingClientRect().top
+      var winH = window.innerHeight
+      window.scrollBy(0, itemTop - winH / 2 + item.clientHeight / 2)
+    }
+  }
 }
 
 var tkCache = {}
@@ -419,14 +429,26 @@ function showTks(para, chap) {
       + '<div class="u"><span>' + esc(t.user || '匿名') + '</span><span class="ip">' + esc(t.ip || '') + (t.lou ? ' <span class="lou">' + t.lou + '楼</span>' : '') + '</span></div>'
       + '<div class="c">' + esc(fmtEmoji(t.content || '')) + '</div>'
       + '<div class="f">' + fmtTime(t.time) + (Number(t.like)>0 ? ' · 👍' + t.like : '') + (Number(t.reply)>0 ? ' · 💬' + t.reply : '') + '</div>'
-      + ((t.hot_reply && t.hot_reply.length) ? t.hot_reply.map(function(r){
-          return '<div class="reply"><span class="ru">' + esc(r.user||'') + '：</span>' + esc(fmtEmoji(r.content||'')) + '</div>'
-        }).join('') : '')
+      + renderReplies(t)
       + '</div>'
   })
   if (!list.length) h = '<div class="tk"><div class="c" style="color:var(--dim)">这一段没有段评</div></div>'
   document.getElementById('tkList').innerHTML = h
   openSheet()
+}
+// 楼中楼渲染：优先全量 replies（补抓数据），无则用旧 hot_reply；按时间正序（先发在上）
+function renderReplies(t) {
+  var rs = (t.replies && t.replies.length) ? t.replies : ((t.hot_reply && t.hot_reply.length) ? t.hot_reply : [])
+  if (!rs.length) return ''
+  var sorted = rs.slice().sort(function(a, b) { return String(a.time || '').localeCompare(String(b.time || '')) })
+  var h = ''
+  for (var i = 0; i < sorted.length; i++) {
+    var r = sorted[i]
+    h += '<div class="reply"><span class="ru">' + esc(r.user || '') + '：</span>' + esc(fmtEmoji(r.content || ''))
+      + (r.time ? '<span class="rt">' + esc(String(r.time).slice(0, 10)) + '</span>' : '')
+      + '</div>'
+  }
+  return h
 }
 function openSheet(){ document.getElementById('sheet').classList.add('open'); document.getElementById('mask').style.display='block'; document.getElementById('sheet').style.display='flex' }
 function closeSheet(){ document.getElementById('sheet').classList.remove('open'); document.getElementById('mask').style.display='none'; setTimeout(function(){document.getElementById('sheet').style.display='none'},250) }
@@ -439,6 +461,7 @@ function goBack() {
 document.getElementById('btnList').onclick = function(){ showChapters(document.getElementById('chapters').style.display !== 'block') }
 document.getElementById('btnFont').onclick = function(){
   fs = fs === 17 ? 20 : fs === 20 ? 23 : 17
+  try { localStorage.setItem('fs', fs) } catch(e){}
   relayout()
 }
 document.getElementById('btnTheme').onclick = function(){

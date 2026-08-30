@@ -9,6 +9,7 @@
 body { background:#f6f2e9; color:#3a372e; font:15px/1.6 "Microsoft YaHei",sans-serif; min-height:100vh; }
 .header { padding:20px 16px 10px; display:flex; align-items:baseline; justify-content:space-between; }
 .header h1 { font-size:22px; } .header h1 span { color:#e8a33d; }
+.header h1 .ver-tag { font-size:11px; color:#8f887a; font-weight:400; margin-left:6px; vertical-align:middle; }
 .header .sub { font-size:12px; color:#8f887a; }
 #shelf { padding:10px 16px 30px; display:grid; grid-template-columns:1fr 1fr; gap:12px; }
 @media (min-width:640px){ #shelf { grid-template-columns:repeat(3,1fr); } }
@@ -42,7 +43,7 @@ body { background:#f6f2e9; color:#3a372e; font:15px/1.6 "Microsoft YaHei",sans-s
 </head>
 <body>
 <div class="header">
-  <h1>📚 书<span>架</span></h1>
+  <h1>📚 书<span>架</span><span class="ver-tag" id="verTag"></span></h1>
   <div class="sub" id="ver">…</div>
 </div>
 <div class="toolbar">
@@ -61,8 +62,12 @@ body { background:#f6f2e9; color:#3a372e; font:15px/1.6 "Microsoft YaHei",sans-s
 <script>
 var shelf = document.getElementById('shelf')
 var editing = false
-// 副标题显示 App 版本号（AppBridge.getVersion），无桥（浏览器预览）时显示 "preview"
-try { document.getElementById('ver').textContent = window.AppBridge ? 'v' + AppBridge.getVersion() : 'preview' } catch(e) {}
+// 副标题+标题标签显示 App 版本号（AppBridge.getVersion），无桥（浏览器预览）时显示 "preview"
+try {
+  var _v = window.AppBridge ? 'v' + AppBridge.getVersion() : 'preview'
+  document.getElementById('ver').textContent = _v
+  document.getElementById('verTag').textContent = _v
+} catch(e) {}
 
 function fmt(n) { return n >= 10000 ? (n/10000).toFixed(1)+'万' : String(n) }
 
