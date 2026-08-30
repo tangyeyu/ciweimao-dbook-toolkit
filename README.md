@@ -44,7 +44,7 @@
 | `ciweimao_vis_crawler.mjs` | 刺猬猫段评可视化爬虫面板 | `http://127.0.0.1:8788` |
 | `qidian_vis_crawler.mjs` | 起点本章说可视化爬虫面板（CDP 驱动） | `http://127.0.0.1:8791` |
 | `dbook_pack_panel.mjs` | `.dbook` 可视化打包面板 | `http://127.0.0.1:8789` |
-| `段评爬虫面板.bat` / `起点段评爬虫面板.bat` / `段评打包面板.bat` | Windows 双击启动器（自动开浏览器） | 双击运行 |
+| `刺猬猫段评爬虫面板.bat` / `起点段评爬虫面板.bat` / `段评打包面板.bat` | Windows 双击启动器（自动开浏览器） | 双击运行 |
 | `build_dbook.mjs` | `.dbook` 打包 CLI | 命令行 |
 | `build_dbook_from_crawler.mjs` | 爬虫数据 → `.dbook` CLI | 命令行 |
 | `qidian_crawler.mjs` | 起点本章说抓取 CLI（CDP 驱动） | 命令行 |
@@ -71,7 +71,7 @@ node ciweimao_vis_crawler.mjs
 # 浏览器打开 http://127.0.0.1:8788
 ```
 
-> Windows 用户也可以直接**双击 `段评爬虫面板.bat`**（自动启动服务并打开浏览器）。
+> Windows 用户也可以直接**双击 `刺猬猫段评爬虫面板.bat`**（自动启动服务并打开浏览器）。
 
 面板上：
 
@@ -116,9 +116,10 @@ node dbook_pack_panel.mjs
 
 > Windows 用户也可以直接**双击 `段评打包面板.bat`**。
 
-- 面板自动扫描已抓取的书 → 每本两个按钮：
+- 面板自动扫描**已抓取的书（刺猬猫 + 起点，卡片带平台标签）** → 每本两个按钮：
   - **📦 打段评包**：只有段评（小，适合已导入过正文的书更新段评）
   - **📚 打完整书**：正文 + 段评（需要提供正文目录，见下文）
+- 起点书直接打段评包即可（App 端已支持 `segments` 结构自动转换，章节标题齐全）
 - 产物输出到 `dbook_out/` 目录
 
 > 📖 **正文从哪来？** 用 `epub2txt.mjs` 把 EPUB 转成书目录结构即可：

@@ -100,6 +100,11 @@ async function getCatalogByNav(bookId) {
     return { title, author, chapters: out };
   })()`)
   if (!data.chapters || !data.chapters.length) throw new Error('目录解析为空：页面可能没渲染出章节（书不存在或浏览器被验证页挡住）')
+  // 书名落盘（打包面板读）
+  try {
+    fs.mkdirSync(path.join(DATA_ROOT, String(bookId)), { recursive: true })
+    fs.writeFileSync(path.join(DATA_ROOT, String(bookId), '_book.json'), JSON.stringify({ book_id: String(bookId), book_name: data.title, author: data.author, fetched_at: new Date().toISOString() }))
+  } catch {}
   return data
 }
 

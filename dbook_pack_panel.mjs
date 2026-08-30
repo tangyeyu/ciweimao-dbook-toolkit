@@ -1,4 +1,4 @@
-// 刺猬猫段评 .dbook 打包面板 v1
+// 刺猬猫/起点段评 .dbook 打包面板 v2（双平台）
 // 零依赖 Node，浏览器操作：扫描已抓取的书 → 一键打包 .dbook（段评包/完整书）
 // 用法: node dbook_pack_panel.mjs [端口=8789]
 // 打开 http://127.0.0.1:8789
@@ -16,6 +16,7 @@ const SIGNATURES = HMAC_KEY + 'CkMxWNB666'
 const UA = 'Android  com.kuangxiangciweimao.novel.c  2.9.365, Xiaomi, 24030PN60G, 34, 14'
 const _here = path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'))
 const DATA_ROOT = process.env.CIWEMAO_DATA || path.join(_here, 'ciweimao_data')
+const QIDIAN_ROOT = process.env.QIDIAN_DATA || path.join(_here, 'qidian_data')
 const TOKEN_FILE = process.env.CIWEMAO_TOKEN || path.join(_here, '_ciweimao_app_token.json')
 const OUT_DIR = process.env.DBOOK_OUT || path.join(_here, 'dbook_out')
 const MAGIC = 'DLCBOOK1'
@@ -77,47 +78,80 @@ async function apiPost(pathname, params, opts = {}) {
   }
 }
 
-// ---------- 扫描已抓取的书 ----------
+// ---------- 扫描已抓取的书（刺猬猫：ciweimao_data/<book_id>/<division_id>/；起点：qidian_data/<book_id>/） ----------
 function scanBooks() {
-  if (!fs.existsSync(DATA_ROOT)) return []
   const books = []
-  for (const bookId of fs.readdirSync(DATA_ROOT)) {
-    if (!/^\d+$/.test(bookId)) continue
-    const bdir = path.join(DATA_ROOT, bookId)
-    const divs = fs.readdirSync(bdir).filter(d => /^\d+$/.test(d)).sort()
-    let chapters = 0, tkFiles = 0, tkTotal = 0, firstTitle = ''
-    const chTk = {}
-    for (const divId of divs) {
-      const cj = path.join(bdir, divId, '_chapters.json')
-      const tkDir = path.join(bdir, divId, 'tsukkomi')
+  // 刺猬猫（卷层级）
+  if (fs.existsSync(DATA_ROOT)) {
+    for (const bookId of fs.readdirSync(DATA_ROOT)) {
+      if (!/^\d+$/.test(bookId)) continue
+      const bdir = path.join(DATA_ROOT, bookId)
+      const divs = fs.readdirSync(bdir).filter(d => /^\d+$/.test(d)).sort()
+      let chapters = 0, tkFiles = 0, tkTotal = 0, firstTitle = ''
+      const chTk = {}
+      for (const divId of divs) {
+        const cj = path.join(bdir, divId, '_chapters.json')
+        const tkDir = path.join(bdir, divId, 'tsukkomi')
+        if (fs.existsSync(cj)) {
+          try {
+            const ch = JSON.parse(fs.readFileSync(cj, 'utf8'))
+            if (!firstTitle && ch[0]?.chapter_title) firstTitle = ch[0].chapter_title
+            chapters += ch.length
+          } catch {}
+        }
+        if (fs.existsSync(tkDir)) {
+          const files = fs.readdirSync(tkDir).filter(f => f.endsWith('.json') && !f.startsWith('_'))
+          tkFiles += files.length
+          for (const f of files) {
+            try {
+              const j = JSON.parse(fs.readFileSync(path.join(tkDir, f), 'utf8'))
+              for (const p of (j.paragraphs || [])) tkTotal += (p.tsukkomi || []).length
+            } catch {}
+          }
+        }
+      }
+      books.push({ platform: 'ciweimao', book_id: bookId, divisions: divs.length, chapters, tk_files: tkFiles, tsukkomi_count: tkTotal, first_title: firstTitle, book_name: '' })
+    }
+  }
+  // 起点（无卷，tsukkomi 直接在书目录下）
+  if (fs.existsSync(QIDIAN_ROOT)) {
+    for (const bookId of fs.readdirSync(QIDIAN_ROOT)) {
+      if (!/^\d+$/.test(bookId)) continue
+      const bdir = path.join(QIDIAN_ROOT, bookId)
+      const tkDir = path.join(bdir, 'tsukkomi')
+      let chapters = 0, tkFiles = 0, tkTotal = 0, firstTitle = '', bookName = ''
+      const cj = path.join(bdir, '_chapters.json')
       if (fs.existsSync(cj)) {
         try {
           const ch = JSON.parse(fs.readFileSync(cj, 'utf8'))
-          if (!firstTitle && ch[0]?.chapter_title) firstTitle = ch[0].chapter_title
-          chapters += ch.length
+          chapters = ch.length
+          if (ch[0]?.chapter_title) firstTitle = ch[0].chapter_title
         } catch {}
       }
+      const bj = path.join(bdir, '_book.json')
+      if (fs.existsSync(bj)) { try { bookName = JSON.parse(fs.readFileSync(bj, 'utf8')).book_name || '' } catch {} }
       if (fs.existsSync(tkDir)) {
         const files = fs.readdirSync(tkDir).filter(f => f.endsWith('.json') && !f.startsWith('_'))
         tkFiles += files.length
         for (const f of files) {
           try {
             const j = JSON.parse(fs.readFileSync(path.join(tkDir, f), 'utf8'))
-            for (const p of (j.paragraphs || [])) tkTotal += (p.tsukkomi || []).length
+            for (const s of (j.segments || [])) tkTotal += (s.tsukkomi || []).length
           } catch {}
         }
       }
+      books.push({ platform: 'qidian', book_id: bookId, divisions: 1, chapters, tk_files: tkFiles, tsukkomi_count: tkTotal, first_title: firstTitle, book_name: bookName })
     }
-    books.push({ book_id: bookId, divisions: divs.length, chapters, tk_files: tkFiles, tsukkomi_count: tkTotal, first_title: firstTitle, book_name: '' })
   }
   return books
 }
 
-// 拉书名（接口，读 token）
+// 拉书名（接口，读 token；仅刺猬猫书需要，起点书名已由爬虫面板存 _book.json）
 async function fetchBookNames(books) {
   const t = readToken()
   if (!t) return books  // 未登录：书名留空
   for (const b of books) {
+    if (b.platform === 'qidian' && b.book_name) continue
     try {
       const r = await apiPost('/book/get_info_by_id', { book_id: b.book_id })
       const info = r?.data?.book_info || r?.data || {}
@@ -144,7 +178,9 @@ function buildDbook(meta, files, outFile) {
   fs.writeFileSync(outFile, Buffer.concat(parts))
 }
 
-async function packBook(bookId, textDir) {
+async function packBook(bookId, textDir, platform) {
+  if (platform === 'qidian') return packQidian(bookId, textDir)
+  // ---- 刺猬猫（多卷合并） ----
   const divs = fs.readdirSync(path.join(DATA_ROOT, bookId)).filter(d => /^\d+$/.test(d)).sort()
   if (!divs.length) throw new Error('没有卷数据')
   let chapters = []
@@ -225,6 +261,62 @@ async function packBook(bookId, textDir) {
   return { meta, files: files.length, size, outFile, divisions: divs.length }
 }
 
+// ---- 起点（无卷，tsukkomi/NNNN.json 直接对应章节号；segments 转 paragraphs 供 App 读取） ----
+async function packQidian(bookId, textDir) {
+  const bdir = path.join(QIDIAN_ROOT, String(bookId))
+  const cjFile = path.join(bdir, '_chapters.json')
+  const tkDir = path.join(bdir, 'tsukkomi')
+  if (!fs.existsSync(cjFile) || !fs.existsSync(tkDir)) throw new Error('起点书数据不完整（缺 _chapters.json 或 tsukkomi/）')
+  const chapters = JSON.parse(fs.readFileSync(cjFile, 'utf8'))
+  const titles = {}
+  for (const c of chapters) titles[String(c.chapter_index)] = c.chapter_title || ''
+  // 书名
+  let bookName = ''
+  try { bookName = JSON.parse(fs.readFileSync(path.join(bdir, '_book.json'), 'utf8')).book_name || '' } catch {}
+  // 段评统计 + 文件表（segments → paragraphs）
+  const files = []
+  let tkTotal = 0
+  const chTk = {}
+  for (const f of fs.readdirSync(tkDir)) {
+    if (!f.endsWith('.json') || f.startsWith('_')) continue
+    const j = JSON.parse(fs.readFileSync(path.join(tkDir, f), 'utf8'))
+    const paragraphs = (j.segments || []).map(s => ({
+      paragraph_index: s.segmentId,
+      amount: String((s.tsukkomi || []).length),
+      tsukkomi: s.tsukkomi || [],
+    }))
+    const n = paragraphs.reduce((a, p) => a + p.tsukkomi.length, 0)
+    chTk[f.replace(/\.json$/, '')] = n
+    tkTotal += n
+    files.push({ name: `tsukkomi/${f}`, data: Buffer.from(JSON.stringify({ ...j, paragraphs }), 'utf8') })
+  }
+  const meta = {
+    book_id: String(bookId),
+    book_name: bookName || chapters[0]?.chapter_title?.replace(/^第.+章\s*/, '') || bookId,
+    author: '',
+    chapter_count: chapters.length,
+    has_tsukkomi: files.length > 0,
+    tsukkomi_count: tkTotal,
+    chapter_tsukkomi: chTk,
+    built_at: new Date().toISOString(),
+  }
+  files.unshift({ name: 'meta.json', data: Buffer.from(JSON.stringify({ ...meta, titles }), 'utf8') })
+  if (textDir && fs.existsSync(textDir)) {
+    for (const c of chapters) {
+      const pad = String(c.chapter_index).padStart(4, '0')
+      for (const sub of ['book-chapters', 'chapters']) {
+        const f = path.join(textDir, sub, pad + '.txt')
+        if (fs.existsSync(f)) { files.push({ name: `chapters/${pad}.txt`, data: fs.readFileSync(f) }); break }
+      }
+    }
+  }
+  if (!fs.existsSync(OUT_DIR)) fs.mkdirSync(OUT_DIR, { recursive: true })
+  const outFile = path.join(OUT_DIR, `${bookId}.dbook`)
+  buildDbook(meta, files, outFile)
+  const size = fs.statSync(outFile).size
+  return { meta, files: files.length, size, outFile, divisions: 1 }
+}
+
 // ---------- 日志 ----------
 const logBuf = []
 function log(msg, kind = '') {
@@ -270,7 +362,7 @@ button:disabled { opacity:.4; cursor:not-allowed; }
 </style></head>
 <body>
 <h1>📦 段评<span class="acc">打包面板</span></h1>
-<div class="sub">爬虫面板抓完 → 这里一键打包 .dbook → 手机 App 导入段评/整书 · 输出到 dbook_out/</div>
+<div class="sub">爬虫面板抓完（刺猬猫 8788 / 起点 8791）→ 这里一键打包 .dbook → 手机 App 导入段评/整书 · 输出到 dbook_out/</div>
 <div class="card"><h2>🔑 登录态 <span id="tokenTag" class="tag">检查中…</span></h2></div>
 <div class="card">
   <h2>📚 已抓取的书 <button id="btnRefresh" class="ghost" style="float:right">刷新</button></h2>
@@ -291,14 +383,14 @@ async function load() {
     $('tokenTag').textContent = st.token ? '已登录：' + st.token.nick + ' (' + st.token.account + ')' : '未登录'
     const books = st.books || []
     const el = $('bookList')
-    if (!books.length) { el.innerHTML = '<div class="empty">还没抓到书 —— 先去「爬虫面板」(8788) 抓段评</div>'; return }
+    if (!books.length) { el.innerHTML = '<div class="empty">还没抓到书 —— 先去「爬虫面板」(刺猬猫 8788 / 起点 8791) 抓段评</div>'; return }
     el.innerHTML = books.map(function(b) {
       return '<div class="book" id="bk-' + b.book_id + '">'
-        + '<div class="top"><span class="name">' + esc(b.book_name || ('书 ' + b.book_id)) + '</span><span class="id">book_id ' + b.book_id + ' · ' + b.divisions + ' 卷</span></div>'
+        + '<div class="top"><span class="name">' + esc(b.book_name || ('书 ' + b.book_id)) + ' <span class="tag">' + (b.platform === 'qidian' ? '起点' : '刺猬猫') + '</span></span><span class="id">book_id ' + b.book_id + ' · ' + b.divisions + ' 卷</span></div>'
         + '<div class="stats">章节 <b>' + b.chapters + '</b> · 段评 <b>' + fmt(b.tsukkomi_count) + '</b> 条 · 段评文件 <b>' + b.tk_files + '</b>' + (b.first_title ? ' · 首章「' + esc(b.first_title.slice(0, 20)) + '」' : '') + '</div>'
         + '<div class="acts">'
-        + '<button data-act="tk" data-id="' + b.book_id + '">📦 打段评包</button>'
-        + '<button class="ghost" data-act="full" data-id="' + b.book_id + '">📚 打完整书</button>'
+        + '<button data-act="tk" data-id="' + b.book_id + '" data-pf="' + b.platform + '">📦 打段评包</button>'
+        + '<button class="ghost" data-act="full" data-id="' + b.book_id + '" data-pf="' + b.platform + '">📚 打完整书</button>'
         + '<input class="txt" id="txt-' + b.book_id + '" placeholder="完整书需正文目录（留空=仅段评）">'
         + '</div></div>'
     }).join('')
@@ -306,19 +398,19 @@ async function load() {
       btn.onclick = function() {
         const id = btn.dataset.id
         const withText = btn.dataset.act === 'full' ? ($('txt-' + id).value.trim() || null) : null
-        pack(id, btn.dataset.act === 'full', withText, btn)
+        pack(id, btn.dataset.act === 'full', withText, btn, btn.dataset.pf)
       }
     })
     // 日志
     if (st.log && st.log.length) { $('log').innerHTML = st.log.map(function(l){ return '<div class="' + l.kind + '">' + esc(l.line) + '</div>' }).join(''); $('log').scrollTop = 99999 }
   } catch(e) { $('bookList').innerHTML = '<div class="empty">加载失败：' + esc(e.message) + '</div>' }
 }
-async function pack(bookId, full, textDir, btn) {
+async function pack(bookId, full, textDir, btn, platform) {
   const orig = btn.textContent
   btn.disabled = true
   btn.textContent = '打包中…'
   try {
-    const r = await api('/api/pack', { book_id: bookId, with_text: textDir })
+    const r = await api('/api/pack', { book_id: bookId, with_text: textDir, platform })
     if (r.ok) {
       logMsg('✅ ' + r.book_name + ' → ' + r.file + ' (' + r.size_mb + ' MB, ' + r.chapters + ' 章, ' + r.tsukkomi + ' 条段评' + (r.divisions > 1 ? ', ' + r.divisions + ' 卷' : '') + ')', 'ok')
       load()
@@ -357,9 +449,11 @@ const server = http.createServer(async (req, res) => {
     let body = ''
     for await (const c of req) body += c
     try {
-      const { book_id, with_text } = JSON.parse(body || '{}')
-      if (!book_id || !fs.existsSync(path.join(DATA_ROOT, String(book_id)))) { send(400, { ok: false, error: '没有这本书的数据' }); return }
-      const r = await packBook(String(book_id), with_text || null)
+      const { book_id, with_text, platform } = JSON.parse(body || '{}')
+      const pf = platform === 'qidian' ? 'qidian' : 'ciweimao'
+      const root = pf === 'qidian' ? QIDIAN_ROOT : DATA_ROOT
+      if (!book_id || !fs.existsSync(path.join(root, String(book_id)))) { send(400, { ok: false, error: '没有这本书的数据' }); return }
+      const r = await packBook(String(book_id), with_text || null, pf)
       log(`✅ ${r.meta.book_name} → ${r.outFile}（${(r.size/1048576).toFixed(1)} MB, ${r.meta.chapter_count} 章, ${r.meta.tsukkomi_count} 条段评${r.divisions > 1 ? ', ' + r.divisions + ' 卷' : ''}）`, 'ok')
       send(200, { ok: true, book_name: r.meta.book_name, file: r.outFile, size_mb: (r.size/1048576).toFixed(1), chapters: r.meta.chapter_count, tsukkomi: r.meta.tsukkomi_count, divisions: r.divisions })
     } catch (e) {
@@ -373,6 +467,7 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, '127.0.0.1', () => {
   console.log(`📦 段评打包面板: http://127.0.0.1:${PORT}`)
-  console.log(`   数据目录: ${DATA_ROOT}`)
+  console.log(`   刺猬猫数据: ${DATA_ROOT}`)
+  console.log(`   起点数据: ${QIDIAN_ROOT}`)
   console.log(`   输出目录: ${OUT_DIR}`)
 })
