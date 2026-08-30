@@ -6,7 +6,7 @@
 
 抓取 → 打包 → 阅读，全流程开源。纯 Node 零依赖，无 Python，无需服务器。
 
-> 🚧 **多平台规划**：当前已支持 **刺猬猫（欢乐书客）**，起点、番茄等平台适配陆续开发中。
+> 🚧 **多平台规划**：当前已支持 **刺猬猫（欢乐书客）** 与 **起点（本章说）**，番茄等平台适配陆续开发中。
 
 </div>
 
@@ -32,7 +32,8 @@
 | 平台 | 段评抓取 | 状态 |
 |---|---|---|
 | 刺猬猫（欢乐书客） | ✅ 完整支持（含付费章段评） | 已可用 |
-| 起点 / 番茄 / 其他 | ⏳ 规划中 | 敬请期待 |
+| 起点（本章说） | ✅ 完整支持（游客可抓，免登录） | 已可用 |
+| 番茄 / 其他 | ⏳ 规划中 | 敬请期待 |
 
 ---
 
@@ -41,10 +42,12 @@
 | 工具 | 作用 | 入口 |
 |---|---|---|
 | `ciweimao_vis_crawler.mjs` | 刺猬猫段评可视化爬虫面板 | `http://127.0.0.1:8788` |
+| `qidian_vis_crawler.mjs` | 起点本章说可视化爬虫面板（CDP 驱动） | `http://127.0.0.1:8791` |
 | `dbook_pack_panel.mjs` | `.dbook` 可视化打包面板 | `http://127.0.0.1:8789` |
-| `段评爬虫面板.bat` / `段评打包面板.bat` | Windows 双击启动器（自动开浏览器） | 双击运行 |
+| `段评爬虫面板.bat` / `起点段评爬虫面板.bat` / `段评打包面板.bat` | Windows 双击启动器（自动开浏览器） | 双击运行 |
 | `build_dbook.mjs` | `.dbook` 打包 CLI | 命令行 |
 | `build_dbook_from_crawler.mjs` | 爬虫数据 → `.dbook` CLI | 命令行 |
+| `qidian_crawler.mjs` | 起点本章说抓取 CLI（CDP 驱动） | 命令行 |
 | `epub2txt.mjs` | EPUB → 分章 TXT | 命令行 |
 | `gen_reader_html.mjs` / `build_index.mjs` | 生成网页版阅读器 | 命令行 |
 | `duoluoxi_app/` | 安卓「段评书架」App 源码 | Gradle 构建 |
@@ -80,6 +83,29 @@ node ciweimao_vis_crawler.mjs
 数据落在 `ciweimao_data/<book_id>/<division_id>/tsukkomi/*.json`。
 
 > 💡 **段评是免费的**：即便章节是付费章节，段评内容也可以不购买直接抓取。
+
+### 第 1.5 步（起点）：启动起点爬虫面板
+
+```bash
+node qidian_vis_crawler.mjs
+# 浏览器打开 http://127.0.0.1:8791
+```
+
+> Windows 用户也可以直接**双击 `起点段评爬虫面板.bat`**。
+
+起点需要借助真实浏览器（过 WAF），操作：
+
+1. 启动带调试端口的 Chrome（面板提示里有命令，一键复制）：
+   ```bash
+   chrome.exe --remote-debugging-port=9222 --user-data-dir=某独立目录
+   ```
+2. 在打开的 Chrome 里访问 `https://www.qidian.com/`（任意书页即可，**无需登录**）
+3. 面板点「🔄 重新检测」→ 输入书 ID（`www.qidian.com/book/<id>/` 末尾数字）→ 查询书籍
+4. 配置起止章节 / 并发 / 间隔 → 开爬，实时进度 + 断点续传
+
+数据落在 `qidian_data/<book_id>/tsukkomi/*.json`。
+
+> 起点接口：`ajax/chapterReview/reviewSummary`（段落+数量）+ `reviewList`（评论，每页 10 条自动翻页）。游客身份即可抓全，付费章段评一样能拿。
 
 ### 第 2 步：打包 .dbook
 
@@ -185,8 +211,10 @@ BOOK_DIR=./book node build_index.mjs       # 生成 reader/index.html
 
 | 变量 | 作用 | 默认 |
 |---|---|---|
-| `CIWEMAO_DATA` | 爬虫数据目录 | `./ciweimao_data` |
-| `CIWEMAO_TOKEN` | 登录态文件路径 | `./_ciweimao_app_token.json` |
+| `CIWEMAO_DATA` | 刺猬猫爬虫数据目录 | `./ciweimao_data` |
+| `CIWEMAO_TOKEN` | 刺猬猫登录态文件路径 | `./_ciweimao_app_token.json` |
+| `QIDIAN_DATA` | 起点爬虫数据目录 | `./qidian_data` |
+| `QIDIAN_CDP` | Chrome 调试端口地址 | `http://127.0.0.1:9222` |
 | `DBOOK_OUT` | 打包输出目录 | `./dbook_out` |
 | `BOOK_DIR` | 书目录（HTML 阅读器用） | `./book` |
 
@@ -203,7 +231,13 @@ BOOK_DIR=./book node build_index.mjs       # 生成 reader/index.html
 ## ❓ FAQ
 
 **Q：需要会员/VIP 才能抓段评吗？**
-A：不需要。段评内容与购买状态无关，免费章节付费章节都能抓（以刺猬猫为例）。
+A：不需要。段评内容与购买状态无关，免费章节付费章节都能抓（刺猬猫、起点均实测）。
+
+**Q：起点为什么需要 Chrome？**
+A：起点 Web 有 WAF 人机校验（JS 指纹），Node 直连会被 202 挑战页拦截。面板通过 Chrome 调试端口借用真实浏览器上下文请求，自动带 cookie 过 WAF。浏览器保持开着起点页面即可，无需登录。
+
+**Q：起点段评数据结构和刺猬猫一样吗？**
+A：字段超集。起点段评含 `nickName / content / likeCount / ipAddress(省) / level(楼层) / rootReviewReplyCount(楼中楼) / essenceStatus(精华) / quoteContent(引用回复)`，简化后统一为 `id/para/user/uid/ip/content/like/unlike/lou/reply/hot_reply/time` 兼容 `.dbook` 打包。
 
 **Q：抓取会不会封号？**
 A：默认并发 4、间隔 200ms 已很保守。别开太高并发刷，单本书全量抓一般没问题。
