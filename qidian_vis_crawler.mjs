@@ -50,7 +50,7 @@ function connect(wsUrl) {
       }
     }
     ws.onopen = () => resolve({
-      call(method, params = {}) {
+      call(method, params = {}, sessionId) {
         return new Promise((res, rej) => {
           const mid = ++id
           // ★CDP 调用超时（45s）：ws 半开连接（TCP 活着但 Chrome 无响应）时 pending 永不 settle → worker 死等
@@ -64,7 +64,9 @@ function connect(wsUrl) {
             res: v => { clearTimeout(timer); res(v) },
             rej: e => { clearTimeout(timer); rej(e) },
           })
-          ws.send(JSON.stringify({ id: mid, method, params }))
+          const msg = { id: mid, method, params }
+          if (sessionId) msg.sessionId = sessionId
+          ws.send(JSON.stringify(msg))
         })
       },
       close() { ws.close() },
@@ -134,19 +136,21 @@ async function wafRefresh() {
 // ---------- 腾讯滑块检测（人工验证） ----------
 // 瑞数 WAF 拉黑是实例级（轮换可解）；但出现腾讯滑块（turing.captcha）通常是 IP 级风控信号——
 // 轮换新实例也会被拦，正确做法是暂停任务、拉起 Chrome 窗口让用户手动过滑块（IP 解封后接口恢复）
+// ★三态返回：true=检测到滑块 / false=确定没有滑块（cdp 健康）/ null=检测失败（cdp 断连等，不能当「滑块没了」）
 async function checkCaptcha() {
+  if (!cdp) return null
   try {
-    if (!cdp) return false
-    // 1. 枚举所有 target（含 iframe），找腾讯滑块
-    const t = await cdp.call('Target.getTargets')
-    const urls = (t.targetInfos || []).map(x => x.url || '')
-    if (urls.some(u => /turing\.captcha|tcaptcha|captcha\.gtimg|drag_ele/i.test(u))) return true
-    // 2. 页面 DOM 里找滑块 iframe / 滑块元素
-    try {
-      const has = await evaluate(`!!document.querySelector('iframe[src*="turing"], iframe[src*="captcha"], iframe[src*="drag_ele"], .tc-drag-thumb, #tcaptcha_iframe, .yidun_panel')`)
-      return !!has
-    } catch { return false }
-  } catch { return false }
+    // ★腾讯系页面普遍预加载隐藏的 turing 验证码 iframe（不弹窗也在），URL/DOM 存在性匹配恒命中 →
+    // 必须判断【可见性】：预加载容器 0 尺寸/display:none（getBoundingClientRect 全 0），真实弹窗才有实际尺寸
+    const has = await evaluate(`(() => {
+      const f = document.querySelector('iframe[src*="turing"], iframe[src*="captcha"], iframe[src*="drag_ele"], #tcaptcha_iframe');
+      if (f) { const r = f.getBoundingClientRect(); if (r.width > 20 && r.height > 20) return true }
+      const y = document.querySelector('.yidun_panel, .tc-drag-thumb, .yidun_slider');
+      if (y) { const r2 = y.getBoundingClientRect(); if (r2.width > 20 && r2.height > 20) return true }
+      return false;
+    })()`)
+    return !!has
+  } catch { return null }
 }
 // 把 Chrome 窗口拉到前台（用户去过滑块）：按 CDP 端口找监听进程 PID，AppActivate 激活
 async function bringChromeFront() {
@@ -158,27 +162,137 @@ async function bringChromeFront() {
     ps.unref()
   } catch {}
 }
-// 检测到滑块：暂停任务 + 拉窗口 + 醒目提示；★轮询等滑块消失（用户拖完滑块）自动恢复，无需手动点继续
+// ★全局恢复监视器（与 worker 协程解耦）：captchaHold 只负责暂停+拉窗口，恢复由独立定时器驱动——
+// 触发 captchaHold 的 worker 即使中途终结/卡死，恢复链也不会断（上次「拖完滑块没自动继续」的根因就是恢复逻辑寄生在 worker 死等里）
+let resumeTimer = null
+function startResumeWatcher() {
+  if (resumeTimer) return
+  let waited = 0
+  resumeTimer = setInterval(async () => {
+    if (!task || !task.running || !task.paused) { clearInterval(resumeTimer); resumeTimer = null; return }
+    waited += 10
+    let res
+    try { res = await checkCaptcha() } catch { res = null }
+    if (res === false) {
+      clearInterval(resumeTimer); resumeTimer = null
+      task.paused = false
+      log('🧍 滑块验证已通过！自动继续抓取…')
+    } else if (waited >= 300) { // 50 分钟上限：强制恢复，宁可进重试也不要永久卡死
+      clearInterval(resumeTimer); resumeTimer = null
+      task.paused = false
+      log('🧍 等待滑块超时（50分钟），强制恢复抓取（若仍被风控会自动重试）…')
+    }
+    // res === null（cdp 断连）：不动作，等下次周期；cdp 恢复后自会判出结果
+  }, 10000)
+}
+// ---------- 滑块自动解决（纯像素模板匹配 + CDP 模拟人类拖动） ----------
+// 原理：腾讯滑块拼图块(.yidun_jigsaw)图案 == 背景图(.yidun_bgimg)缺口处的图案 →
+// 在滑块 iframe 内把两张图画进 canvas，逐列像素差分找最小差异位置 = 缺口 x；
+// 再用 CDP Input.dispatchMouseEvent 模拟人类轨迹（先快后慢+抖动）把滑块拖到缺口。
+// 零模型零下载零网络费用；识别失败会回退到暂停等人工。
+async function evaluateIn(sessionId, expr) {
+  const r = await cdp.call('Runtime.evaluate', { expression: expr, returnByValue: true, awaitPromise: true }, sessionId)
+  if (r.exceptionDetails) throw new Error('iframe执行异常: ' + String(r.exceptionDetails.exception?.description || r.exceptionDetails.text).slice(0, 200))
+  return r.result?.value
+}
+async function solveCaptcha() {
+  if (!cdp) return false
+  // 1. 找滑块 target（turing/tcaptcha/drag_ele）
+  const t = await cdp.call('Target.getTargets')
+  const target = (t.targetInfos || []).find(x => /turing\.captcha|tcaptcha|captcha\.gtimg|drag_ele/i.test(x.url || ''))
+  if (!target) return false
+  // 2. attach 到滑块 target 拿 sessionId
+  const att = await cdp.call('Target.attachToTarget', { targetId: target.targetId, flatten: true })
+  const sid = att.sessionId
+  if (!sid) return false
+  try {
+    // 3. iframe 内读背景图/拼图块/滑块，画 canvas 模板匹配找缺口 x
+    const info = await evaluateIn(sid, `(async () => {
+      const bg = document.querySelector('.yidun_bgimg, .yidun_bg-img, .tc-bgimg, .yidun_bg')
+      const jig = document.querySelector('.yidun_jigsaw, .tc-jpp, .yidun_jigsaw__jigsaw')
+      if (!bg || !jig) return JSON.stringify({ error: 'no img' })
+      const load = (img) => new Promise(res => { const i = new Image(); i.onload = () => res(i); i.onerror = () => res(null); i.src = img.src })
+      const bi = await load(bg), ji = await load(jig)
+      if (!bi || !ji) return JSON.stringify({ error: 'load fail' })
+      const c1 = document.createElement('canvas'); c1.width = bi.naturalWidth; c1.height = bi.naturalHeight
+      const c1x = c1.getContext('2d', { willReadFrequently: true }); c1x.drawImage(bi, 0, 0)
+      const bd = c1x.getImageData(0, 0, c1.width, c1.height).data
+      const c2 = document.createElement('canvas'); c2.width = ji.naturalWidth; c2.height = ji.naturalHeight
+      const c2x = c2.getContext('2d', { willReadFrequently: true }); c2x.drawImage(ji, 0, 0)
+      const jd = c2x.getImageData(0, 0, c2.width, c2.height).data
+      const jw = c2.width, jh = c2.height, bw = c1.width
+      let best = 0, bestScore = Infinity
+      const step = Math.max(1, Math.floor(jw / 50))
+      const cmp = (x) => { let s = 0, n = 0; for (let jy = 0; jy < jh; jy += 3) { for (let jx = 0; jx < jw; jx += 3) { const ji2 = (jy * jw + jx) * 4; if (jd[ji2 + 3] < 40) continue; const pi = (jy * bw + (x + jx)) * 4; const dr = bd[pi] - jd[ji2], dg = bd[pi+1] - jd[ji2+1], db = bd[pi+2] - jd[ji2+2]; s += dr*dr + dg*dg + db*db; n++ } } return n ? s / n : Infinity }
+      for (let x = 0; x <= bw - jw; x += step) { const sc = cmp(x); if (sc < bestScore) { bestScore = sc; best = x } }
+      for (let x = Math.max(0, best - step); x <= Math.min(bw - jw, best + step); x++) { const sc = cmp(x); if (sc < bestScore) { bestScore = sc; best = x } }
+      const bgRect = bg.getBoundingClientRect()
+      const jigRect = jig.getBoundingClientRect()
+      const sl = document.querySelector('.yidun_slider, .tc-drag-thumb, .yidun_slider__icon')
+      const sRect = sl ? sl.getBoundingClientRect() : null
+      const scale = bgRect.width / c1.width
+      return JSON.stringify({ gapX: best, scale, bgRect: { x: bgRect.x, y: bgRect.y, w: bgRect.width, h: bgRect.height }, jigRect: { x: jigRect.x, y: jigRect.y, w: jigRect.width, h: jigRect.height }, sRect: sRect ? { x: sRect.x, y: sRect.y, w: sRect.width, h: sRect.height } : null, bw: c1.width, ok: true })
+    })()`)
+    const inf = JSON.parse(info)
+    if (!inf.ok || !inf.sRect) { log('🧩 滑块结构未识别: ' + (inf.error || 'no slider rect')); return false }
+    // 4. 主页面读滑块 iframe 的视口偏移（布局信息跨域可读）
+    const frect = JSON.parse(await evaluate(`(() => { const f = document.querySelector('iframe[src*="turing"], iframe[src*="captcha"], iframe[src*="drag_ele"], #tcaptcha_iframe'); return f ? JSON.stringify(f.getBoundingClientRect()) : JSON.stringify(null) })()`))
+    if (!frect) { log('🧩 找不到滑块 iframe 偏移'); return false }
+    // 5. 计算拖动：拼图块中心 → 缺口中心（屏幕坐标）
+    const iframeX = frect.x, iframeY = frect.y
+    const startX = iframeX + inf.jigRect.x + inf.jigRect.w / 2
+    const startY = iframeY + inf.jigRect.y + inf.jigRect.h / 2
+    const gapCenterX = iframeX + inf.bgRect.x + (inf.gapX + inf.jigRect.w / inf.scale) * inf.scale
+    const dist = gapCenterX - startX
+    if (!(dist > 5 && dist < 500)) { log('🧩 拖动距离异常: ' + dist.toFixed(1) + 'px'); return false }
+    // 6. 模拟人类轨迹拖动（easeOutCubic 先快后慢 + 随机抖动 + 过冲微调）
+    const steps = 28 + Math.floor(Math.random() * 10)
+    const ms = 500 + Math.random() * 300
+    await cdp.call('Input.dispatchMouseEvent', { type: 'mouseMoved', x: startX, y: startY })
+    await cdp.call('Input.dispatchMouseEvent', { type: 'mousePressed', x: startX, y: startY, button: 'left', buttons: 1, clickCount: 1 })
+    let prevX = startX
+    for (let i = 1; i <= steps; i++) {
+      const t = i / steps
+      const ease = 1 - Math.pow(1 - t, 3)
+      const jitter = (Math.random() - 0.5) * 2.4
+      const x = startX + dist * ease + jitter
+      const y = startY + (Math.random() - 0.5) * 2
+      await cdp.call('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y, button: 'left', buttons: 1 })
+      prevX = x
+      await new Promise(r => setTimeout(r, ms / steps))
+    }
+    // 过冲回拉微调（人类习惯）
+    await cdp.call('Input.dispatchMouseEvent', { type: 'mouseMoved', x: prevX + 3 + Math.random() * 4, y: startY + (Math.random() - 0.5) * 1.5, button: 'left', buttons: 1 })
+    await new Promise(r => setTimeout(r, 60 + Math.random() * 80))
+    await cdp.call('Input.dispatchMouseEvent', { type: 'mouseReleased', x: prevX + 3, y: startY, button: 'left', buttons: 0, clickCount: 1 })
+    // 7. 等 2.5s 验证滑块是否消失
+    await new Promise(r => setTimeout(r, 2500))
+    const gone = await checkCaptcha()
+    log(`🧩 自动过滑块: 缺口x=${inf.gapX} 距离=${dist.toFixed(0)}px ${gone === false ? '✓ 通过' : (gone === true ? '✗ 滑块仍在' : '? 检测异常')}`)
+    return gone === false
+  } catch (e) {
+    log('🧩 自动过滑块异常: ' + String(e.message || e).slice(0, 150))
+    return false
+  } finally {
+    try { await cdp.call('Target.detachFromTarget', { sessionId: sid }) } catch (e) {}
+  }
+}
+
+// 检测到滑块：先自动尝试过（最多 3 次）；自动失败才暂停等人工（恢复交给全局监视器）
 async function captchaHold(who) {
   const hit = await checkCaptcha()
-  if (!hit) return false
-  if (task) task.paused = true
-  log(`🧍 检测到腾讯滑块验证（${who}）！已暂停任务——请到弹出的 Chrome 窗口拖动滑块完成验证，本小姐会自动检测恢复…`)
-  await bringChromeFront()
-  // ★自动恢复：每 10s 检测一次滑块是否消失（用户完成验证后 iframe 会关闭），消失即恢复抓取
-  if (task) {
-    let waited = 0
-    while (task.running && task.paused && waited < 300) { // 最多等 50 分钟
-      await sleep(10000)
-      waited += 10
-      if (!(await checkCaptcha())) {
-        task.paused = false
-        log(`🧍 滑块验证已通过！自动继续抓取…`)
-        await sleep(3000) // 给 IP 解封一点生效时间
-        break
-      }
-    }
+  if (hit !== true) return false
+  for (let i = 1; i <= 3; i++) {
+    log(`🧩 检测到腾讯滑块（${who}）！尝试自动解决（第${i}/3次）…`)
+    let solved = false
+    try { solved = await solveCaptcha() } catch (e) { log('🧩 自动过滑块异常: ' + String(e.message || e).slice(0, 150)) }
+    if (solved) { log('🧩 滑块自动通过！继续抓取…'); return true }
+    await sleep(5000)
   }
+  if (task) task.paused = true
+  log('🧩 自动过滑块 3 次失败，暂停等人工——请到弹出的 Chrome 窗口拖动滑块完成验证（拖完自动继续）…')
+  await bringChromeFront()
+  startResumeWatcher()
   return true
 }
 // ---------- WAF 实例轮换 ----------
@@ -613,6 +727,53 @@ const server = http.createServer(async (req, res) => {
       const ok = await rotateChrome()
       return json(res, 200, { ok })
     }
+    // ★手动恢复：用户验证完滑块/确认没滑块后一键继续（不依赖自动检测）。清 resumeTimer 防自动定时器干扰
+    if (req.method === 'POST' && p === '/api/resume') {
+      if (task && task.paused && task.running) {
+        if (resumeTimer) { clearInterval(resumeTimer); resumeTimer = null }
+        task.paused = false
+        log('✅ 手动恢复抓取（用户确认滑块已处理）')
+      }
+      return json(res, 200, { paused: task?.paused || false }) 
+    }
+    // ★一键打开浏览器：CDP 未连接时自动杀占端口的残留 Chrome + 起全新实例连上；已连接则直接返回
+    if (req.method === 'POST' && p === '/api/launch-browser') {
+      const cdpSt = await ensureCdp()
+      if (cdpSt.ok) return json(res, 200, { ok: true, message: '浏览器已连接', url: cdpSt.url })
+      try {
+        const cdpPort = new URL(CDP_URL).port || '9222'
+        let portBusy = false
+        try { await fetch(CDP_URL + '/json/version', { signal: AbortSignal.timeout(2000) }); portBusy = true } catch { portBusy = false }
+        if (portBusy) {
+          // 端口被"死"Chrome 占着（监听但 CDP 不响应）：用 taskkill 强杀占端口进程
+          log('⚠️ CDP 端口被残留浏览器占用，尝试清理…')
+          const ps = spawn('powershell', ['-NoProfile', '-Command',
+            `$c=Get-NetTCPConnection -LocalPort ${cdpPort} -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1; if($c){taskkill /PID $c.OwningProcess /T /F}`],
+            { stdio: 'ignore', detached: true })
+          ps.unref()
+          await sleep(2500)
+        }
+        const chromePath = await findChrome()
+        const profile = path.join(_here, '_qidian_auto_' + Math.random().toString(36).slice(2, 10))
+        const bookUrl = task && task.bookId ? `https://www.qidian.com/book/${task.bookId}/` : 'https://www.qidian.com/'
+        const args = [`--remote-debugging-port=${cdpPort}`, `--user-data-dir=${profile}`, '--no-first-run', '--no-default-browser-check', '--disable-fre', '--no-sandbox', bookUrl]
+        log('🚀 打开浏览器: ' + chromePath + ' (端口 ' + cdpPort + ')')
+        const child = spawn(chromePath, args, { detached: true, stdio: 'ignore' })
+        child.unref()
+        let ready = false
+        for (let i = 0; i < 40; i++) { try { const l = await (await fetch(CDP_URL + '/json/version', { signal: AbortSignal.timeout(2000) }).catch(() => null)); if (l && l.webSocketDebuggerUrl) { ready = true; break } } catch {} await sleep(500) }
+        if (!ready) return json(res, 500, { error: 'Chrome 启动失败：请检查环境变量 CHROME_PATH 或手动启动浏览器' })
+        // 重建 CDP 连接 + 等书页指纹
+        let tabFound = false
+        for (let i = 0; i < 30; i++) { try { const page = await findPageTab(); if (page) { cdpPageUrl = page.url; if (!cdp) cdp = await connect(page.webSocketDebuggerUrl); tabFound = true; break } } catch {} await sleep(1000) }
+        if (!tabFound) return json(res, 500, { error: '浏览器已开但找不到起点页面标签，请手动打开 www.qidian.com' })
+        await sleep(3000)
+        log('✅ 浏览器已打开并连接')
+        return json(res, 200, { ok: true, message: '浏览器已启动并连接' })
+      } catch (e) {
+        return json(res, 500, { error: String(e.message || e) })
+      }
+    }
     if (req.method === 'POST' && p === '/api/stop') {
       if (task) { task.running = false; task.paused = false; saveState(); log('已停止，进度已保存') }
       return json(res, 200, { ok: true })
@@ -674,12 +835,16 @@ button.ghost { background:#2a2f38; color:var(--fg); font-weight:400; }
 <div class="card">
   <h2>🔌 浏览器连接 <span id="cdpTag" class="tag">检查中…</span></h2>
   <div class="hint">
-    步骤：① 启动 Chrome：<code>chrome.exe --remote-debugging-port=9222 --user-data-dir=某个独立目录</code><br>
-    ② 在打开的 Chrome 里访问 <code>https://www.qidian.com/</code>（任意书页即可，无需登录）<br>
-    ③ 回到本页面点「重新检测」。爬虫会借用该浏览器抓取，期间别关标签页。<br>
-    <span style="color:var(--acc)">🛡 遇到 WAF 实例级拉黑时面板会自动关掉旧 Chrome、轮换全新实例继续抓取（自动找 chrome.exe，或用环境变量 CHROME_PATH 指定路径）</span>
+    ① 点下方「🚀 打开浏览器」——面板自动拉起一个专用 Chrome 并连上（不用手动敲命令）<br>
+    ② 或手动：<code>chrome.exe --remote-debugging-port=9222 --user-data-dir=某个独立目录</code> 再访问 <code>https://www.qidian.com/</code>（任意书页，无需登录）<br>
+    ③ 爬虫借用该浏览器抓取，期间别关标签页。遇到 WAF 实例级拉黑会自动轮换全新实例继续。<br>
+    <span style="color:var(--acc)">🛡 滑块验证后若不自动继续，点下方「✅ 继续抓取」手动恢复（不用等自动检测）</span>
   </div>
-  <div class="row"><button id="btnCdp" class="ghost">🔄 重新检测</button></div>
+  <div class="row">
+    <button id="btnLaunch">🚀 打开浏览器</button>
+    <button id="btnCdp" class="ghost">🔄 重新检测</button>
+    <button id="btnResume" class="ghost" style="display:none">✅ 继续抓取</button>
+  </div>
 </div>
 
 <div class="card">
@@ -754,11 +919,14 @@ async function refresh() {
       $('btnPause').disabled = !t.running
       $('btnStop').disabled = !t.running
       $('btnPause').textContent = t.paused ? '▶ 继续' : '⏸ 暂停'
+      // ★滑块暂停时显示醒目的手动恢复按钮（不依赖自动检测）
+      $('btnResume').style.display = (t.running && t.paused) ? 'inline-block' : 'none'
     } else {
       $('sDone').textContent = '0'; $('sTodo').textContent = '0'; $('sPct').textContent = '0%'
       $('sTime').textContent = '0s'; $('sState').textContent = '空闲'; $('sCur').textContent = '—'
       $('barFill').style.width = '0%'
       $('btnStart').disabled = false; $('btnPause').disabled = true; $('btnStop').disabled = true
+      $('btnResume').style.display = 'none'
     }
     if (st.log && st.log.length) {
       const lg = $('log')
@@ -776,6 +944,22 @@ setInterval(refresh, 1500); refresh()
 $('btnCdp').onclick = async () => {
   const st = await api('/api/status')
   setMsg('bookMsg', st.cdp.ok ? '浏览器连接正常 ✓' : '未连接：' + (st.cdp.error || '请按上方步骤操作'), st.cdp.ok)
+  refresh()
+}
+
+// ★打开浏览器：CDP 断了或没连上时一键拉起全新 Chrome（自动解决「浏览器链接连接不了」）
+$('btnLaunch').onclick = async () => {
+  setMsg('bookMsg', '正在打开浏览器…', true)
+  const r = await api('/api/launch-browser', {})
+  if (r.ok) setMsg('bookMsg', '浏览器已就绪 ✓ URL=' + r.url, true)
+  else setMsg('bookMsg', '打开失败：' + r.error, false)
+  refresh()
+}
+
+// ★手动恢复：滑块验证完/被暂停时点一下就继续抓（不依赖自动检测）
+$('btnResume').onclick = async () => {
+  const r = await api('/api/resume', {})
+  setMsg('bookMsg', r.error ? '恢复失败：' + r.error : '已恢复抓取 ✓', !r.error)
   refresh()
 }
 
