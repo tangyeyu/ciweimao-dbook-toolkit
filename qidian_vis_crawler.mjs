@@ -143,10 +143,14 @@ async function checkCaptcha() {
     // ★腾讯系页面普遍预加载隐藏的 turing 验证码 iframe（不弹窗也在），URL/DOM 存在性匹配恒命中 →
     // 必须判断【可见性】：预加载容器 0 尺寸/display:none（getBoundingClientRect 全 0），真实弹窗才有实际尺寸
     const has = await evaluate(`(() => {
+      const vw = window.innerWidth, vh = window.innerHeight
+      // ★必须【视口内可见】：起点把 turing iframe 预加载到 y=-1000000 隐藏区（getBoundingClientRect 仍有 300x150），
+      // 旧 rect>20 判定对隐藏 iframe 恒命中 → 误暂停。只有 top/left 落在视口内才算真弹出。
+      const inView = (r, cs) => r.width > 20 && r.height > 20 && r.top >= -5 && r.top < vh && r.left >= -5 && r.left < vw && cs.display !== 'none' && cs.visibility !== 'hidden' && parseFloat(cs.opacity || '1') > 0
       const f = document.querySelector('iframe[src*="turing"], iframe[src*="captcha"], iframe[src*="drag_ele"], #tcaptcha_iframe');
-      if (f) { const r = f.getBoundingClientRect(); if (r.width > 20 && r.height > 20) return true }
-      const y = document.querySelector('.yidun_panel, .tc-drag-thumb, .yidun_slider');
-      if (y) { const r2 = y.getBoundingClientRect(); if (r2.width > 20 && r2.height > 20) return true }
+      if (f) { const r = f.getBoundingClientRect(); const cs = getComputedStyle(f); if (inView(r, cs)) return true }
+      const y = document.querySelector('.yidun_panel, .tc-drag-thumb, .yidun_slider, .tc-captcha');
+      if (y) { const r2 = y.getBoundingClientRect(); const cs2 = getComputedStyle(y); if (inView(r2, cs2)) return true }
       return false;
     })()`)
     return !!has
@@ -206,35 +210,46 @@ async function solveCaptcha() {
   const sid = att.sessionId
   if (!sid) return false
   try {
-    // 3. iframe 内读背景图/拼图块/滑块，画 canvas 模板匹配找缺口 x
+    // 跨域 iframe 必须先 Runtime.enable 才能读（探测实证：不加会返回 undefined）
+    await cdp.call('Runtime.enable', {}, sid).catch(() => {})
+    // 3. iframe 内：读 #tcImgArea 背景图(270x193) + 拼图块(51x51)，canvas 差分找缺口 x
     const info = await evaluateIn(sid, `(async () => {
-      const bg = document.querySelector('.yidun_bgimg, .yidun_bg-img, .tc-bgimg, .yidun_bg')
-      const jig = document.querySelector('.yidun_jigsaw, .tc-jpp, .yidun_jigsaw__jigsaw')
-      if (!bg || !jig) return JSON.stringify({ error: 'no img' })
-      const load = (img) => new Promise(res => { const i = new Image(); i.onload = () => res(i); i.onerror = () => res(null); i.src = img.src })
-      const bi = await load(bg), ji = await load(jig)
-      if (!bi || !ji) return JSON.stringify({ error: 'load fail' })
-      const c1 = document.createElement('canvas'); c1.width = bi.naturalWidth; c1.height = bi.naturalHeight
-      const c1x = c1.getContext('2d', { willReadFrequently: true }); c1x.drawImage(bi, 0, 0)
-      const bd = c1x.getImageData(0, 0, c1.width, c1.height).data
-      const c2 = document.createElement('canvas'); c2.width = ji.naturalWidth; c2.height = ji.naturalHeight
-      const c2x = c2.getContext('2d', { willReadFrequently: true }); c2x.drawImage(ji, 0, 0)
-      const jd = c2x.getImageData(0, 0, c2.width, c2.height).data
-      const jw = c2.width, jh = c2.height, bw = c1.width
-      let best = 0, bestScore = Infinity
-      const step = Math.max(1, Math.floor(jw / 50))
-      const cmp = (x) => { let s = 0, n = 0; for (let jy = 0; jy < jh; jy += 3) { for (let jx = 0; jx < jw; jx += 3) { const ji2 = (jy * jw + jx) * 4; if (jd[ji2 + 3] < 40) continue; const pi = (jy * bw + (x + jx)) * 4; const dr = bd[pi] - jd[ji2], dg = bd[pi+1] - jd[ji2+1], db = bd[pi+2] - jd[ji2+2]; s += dr*dr + dg*dg + db*db; n++ } } return n ? s / n : Infinity }
-      for (let x = 0; x <= bw - jw; x += step) { const sc = cmp(x); if (sc < bestScore) { bestScore = sc; best = x } }
-      for (let x = Math.max(0, best - step); x <= Math.min(bw - jw, best + step); x++) { const sc = cmp(x); if (sc < bestScore) { bestScore = sc; best = x } }
-      const bgRect = bg.getBoundingClientRect()
-      const jigRect = jig.getBoundingClientRect()
-      const sl = document.querySelector('.yidun_slider, .tc-drag-thumb, .yidun_slider__icon')
-      const sRect = sl ? sl.getBoundingClientRect() : null
-      const scale = bgRect.width / c1.width
-      return JSON.stringify({ gapX: best, scale, bgRect: { x: bgRect.x, y: bgRect.y, w: bgRect.width, h: bgRect.height }, jigRect: { x: jigRect.x, y: jigRect.y, w: jigRect.width, h: jigRect.height }, sRect: sRect ? { x: sRect.x, y: sRect.y, w: sRect.width, h: sRect.height } : null, bw: c1.width, ok: true })
+      const wait = (ms) => new Promise(r => setTimeout(r, ms))
+      for (let k = 0; k < 20; k++) {
+        const imgs = [...document.querySelectorAll('img')]
+        // 拼图块：方正 naturalWidth 60-130 且显示 30-80 方形（真实起点是 96x96 显示 51）
+        const jig = imgs.find(i => { if (!(i.naturalWidth === i.naturalHeight && i.naturalWidth > 60 && i.naturalWidth < 130 && i.complete)) return false; const r = i.getBoundingClientRect(); return r.width > 30 && r.width < 80 && Math.abs(r.width - r.height) < 4 })
+        // 背景：带 background-image url(data:image) 的 DIV，取 base64（★真实起点背景是 css background-image，非 img）
+        let bgEl = null, bgBase64 = null
+        for (const el of document.querySelectorAll('*')) { const b = getComputedStyle(el).backgroundImage; if (b && b.startsWith('url("data:image')) { const m = b.match(/data:image\\/[a-z]+;base64,([A-Za-z0-9+/=]+)/); if (m) { bgBase64 = m[1]; bgEl = el; break } } }
+        if (jig && bgBase64 && jig.complete) {
+          const jb64 = (jig.currentSrc || jig.src).match(/base64,([A-Za-z0-9+/=]+)/)[1]
+          const load = (b) => new Promise(res => { const i = new Image(); i.onload = () => res(i); i.onerror = () => res(null); i.src = 'data:image/png;base64,' + b })
+          const bi = await load(bgBase64), ji = await load(jb64)
+          if (bi && ji && bi.naturalWidth > 100 && ji.naturalWidth > 0) {
+            const bw = bi.naturalWidth, bh = bi.naturalHeight, jw = ji.naturalWidth, jh = ji.naturalHeight
+            const c1 = document.createElement('canvas'); c1.width = bw; c1.height = bh
+            const x1 = c1.getContext('2d', { willReadFrequently: true }); x1.drawImage(bi, 0, 0)
+            const bd = x1.getImageData(0, 0, bw, bh).data
+            // ★找最白窗口 = 白色半透明缺口（2D 滑窗，平均RGB最大）——不是和拼图块匹配（已验证方向会错）
+            const bright = (x, y) => { let s = 0, n = 0; for (let yy = 0; yy < Math.min(jh, bh - y); yy += 2) { for (let xx = 0; xx < Math.min(jw, bw - x); xx += 2) { const pi = ((y + yy) * bw + (x + xx)) * 4; s += bd[pi] + bd[pi+1] + bd[pi+2]; n++ } } return n ? s / n : -1 }
+            let bestX = 0, bestY = 0, bestScore = -1
+            const step = Math.max(1, Math.floor(jw / 4)), yStep = Math.max(1, Math.floor(jh / 3))
+            for (let y = 0; y <= bh - jh; y += yStep) for (let x = 0; x <= bw - jw; x += step) { const sc = bright(x, y); if (sc > bestScore) { bestScore = sc; bestX = x; bestY = y } }
+            const fineX = Math.max(1, Math.floor(step / 2)), fineY = Math.max(1, Math.floor(yStep / 2))
+            for (let y = Math.max(0, bestY - yStep); y <= Math.min(bh - jh, bestY + yStep); y += fineY) for (let x = Math.max(0, bestX - step); x <= Math.min(bw - jw, bestX + step); x += fineX) { const sc = bright(x, y); if (sc > bestScore) { bestScore = sc; bestX = x; bestY = y } }
+            for (let y = Math.max(0, bestY - 2); y <= Math.min(bh - jh, bestY + 2); y++) for (let x = Math.max(0, bestX - 2); x <= Math.min(bw - jw, bestX + 2); x++) { const sc = bright(x, y); if (sc > bestScore) { bestScore = sc; bestX = x; bestY = y } }
+            const bgRect = bgEl.getBoundingClientRect(), jigRect = jig.getBoundingClientRect()
+            return JSON.stringify({ gapX: bestX, gapY: bestY, score: bestScore, scale: bgRect.width / bw, bgRect: { x: bgRect.x, y: bgRect.y, w: bgRect.width }, jigRect: { x: jigRect.x, y: jigRect.y, w: jigRect.width }, bw, jw, ok: true })
+          }
+        }
+        await wait(250)
+      }
+      return JSON.stringify({ error: 'no mat', ok: false })
     })()`)
     const inf = JSON.parse(info)
-    if (!inf.ok || !inf.sRect) { log('🧩 滑块结构未识别: ' + (inf.error || 'no slider rect')); return false }
+    if (!inf.ok) { log('🧩 滑块结构未识别: ' + (inf.error || 'unknown')); return false }
+    if (!(inf.score >= 0)) { log('🧩 滑块差分无有效 score'); return false }
     // 4. 主页面读滑块 iframe 的视口偏移（布局信息跨域可读）
     const frect = JSON.parse(await evaluate(`(() => { const f = document.querySelector('iframe[src*="turing"], iframe[src*="captcha"], iframe[src*="drag_ele"], #tcaptcha_iframe'); return f ? JSON.stringify(f.getBoundingClientRect()) : JSON.stringify(null) })()`))
     if (!frect) { log('🧩 找不到滑块 iframe 偏移'); return false }
@@ -242,7 +257,7 @@ async function solveCaptcha() {
     const iframeX = frect.x, iframeY = frect.y
     const startX = iframeX + inf.jigRect.x + inf.jigRect.w / 2
     const startY = iframeY + inf.jigRect.y + inf.jigRect.h / 2
-    const gapCenterX = iframeX + inf.bgRect.x + (inf.gapX + inf.jigRect.w / inf.scale) * inf.scale
+    const gapCenterX = iframeX + inf.bgRect.x + (inf.gapX + (inf.jw || inf.jigRect.w) / 2) * inf.scale
     const dist = gapCenterX - startX
     if (!(dist > 5 && dist < 500)) { log('🧩 拖动距离异常: ' + dist.toFixed(1) + 'px'); return false }
     // 6. 模拟人类轨迹拖动（easeOutCubic 先快后慢 + 随机抖动 + 过冲微调）
@@ -278,19 +293,20 @@ async function solveCaptcha() {
   }
 }
 
-// 检测到滑块：先自动尝试过（最多 3 次）；自动失败才暂停等人工（恢复交给全局监视器）
+// 检测到滑块：【优先自动过】——像素差分找缺口+模拟拖拽（零 token 纯本地），最多 3 次；自动失败才暂停拉窗等人工（手动「✅ 继续抓取」恢复）
+// 依据：用户要求「以后就自动验证滑块」，自动过不掉再兜底人工。
 async function captchaHold(who) {
   const hit = await checkCaptcha()
   if (hit !== true) return false
   for (let i = 1; i <= 3; i++) {
-    log(`🧩 检测到腾讯滑块（${who}）！尝试自动解决（第${i}/3次）…`)
+    log(`🧩 检测到可见滑块（${who}）！自动解决（第${i}/3次）…`)
     let solved = false
     try { solved = await solveCaptcha() } catch (e) { log('🧩 自动过滑块异常: ' + String(e.message || e).slice(0, 150)) }
     if (solved) { log('🧩 滑块自动通过！继续抓取…'); return true }
     await sleep(5000)
   }
   if (task) task.paused = true
-  log('🧩 自动过滑块 3 次失败，暂停等人工——请到弹出的 Chrome 窗口拖动滑块完成验证（拖完自动继续）…')
+  log('🧩 自动过滑块 3 次失败，暂停——请在弹出的 Chrome 窗口拖动滑块完成验证，然后点「✅ 继续抓取」恢复…')
   await bringChromeFront()
   startResumeWatcher()
   return true
@@ -333,6 +349,19 @@ async function rotateChrome() {
       await sleep(500)
     }
     await sleep(1500)
+    // 2.5 清理陈旧的轮换 profile（只删 >1 天的，防越攒越多，保留在用的/最新的）
+    try {
+      const now = Date.now()
+      let removed = 0
+      for (const name of fs.readdirSync(_here)) {
+        if (!name.startsWith('_qidian_auto_')) continue
+        const p = path.join(_here, name)
+        try {
+          if (now - fs.statSync(p).mtimeMs > 86400000) { fs.rmSync(p, { recursive: true, force: true }); removed++ }
+        } catch {}
+      }
+      if (removed) log(`  🧹 顺手清理 ${removed} 个旧轮换 profile`)
+    } catch {}
     // 3. 起新 Chrome：同 CDP 端口 + 全新独立 profile（全新指纹）
     const profile = path.join(_here, '_qidian_auto_' + Math.random().toString(36).slice(2, 10))
     const chromePath = await findChrome()
@@ -843,7 +872,7 @@ button.ghost { background:#2a2f38; color:var(--fg); font-weight:400; }
   <div class="row">
     <button id="btnLaunch">🚀 打开浏览器</button>
     <button id="btnCdp" class="ghost">🔄 重新检测</button>
-    <button id="btnResume" class="ghost" style="display:none">✅ 继续抓取</button>
+    <button id="btnResume" class="ghost" disabled>✅ 继续抓取</button>
   </div>
 </div>
 
@@ -919,14 +948,14 @@ async function refresh() {
       $('btnPause').disabled = !t.running
       $('btnStop').disabled = !t.running
       $('btnPause').textContent = t.paused ? '▶ 继续' : '⏸ 暂停'
-      // ★滑块暂停时显示醒目的手动恢复按钮（不依赖自动检测）
-      $('btnResume').style.display = (t.running && t.paused) ? 'inline-block' : 'none'
+      // 始终显示「继续抓取」，仅在运行中被暂停时点亮可点（平时灰置）
+      $('btnResume').disabled = !(t.running && t.paused)
     } else {
       $('sDone').textContent = '0'; $('sTodo').textContent = '0'; $('sPct').textContent = '0%'
       $('sTime').textContent = '0s'; $('sState').textContent = '空闲'; $('sCur').textContent = '—'
       $('barFill').style.width = '0%'
       $('btnStart').disabled = false; $('btnPause').disabled = true; $('btnStop').disabled = true
-      $('btnResume').style.display = 'none'
+      $('btnResume').disabled = true
     }
     if (st.log && st.log.length) {
       const lg = $('log')
