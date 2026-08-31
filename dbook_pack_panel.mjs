@@ -271,23 +271,45 @@ async function packBook(bookId, textDir, platform) {
 }
 
 // ---- 起点（无卷，tsukkomi/NNNN.json 直接对应章节号；segments 转 paragraphs 供 App 读取） ----
+// ★重排：爬虫 tsukkomi 是起点章节序（含公告占位），App txt 书是 txt 序——
+//   必须按 _aligned.json 映射重命名到 txt 章号 + titles 用 txt 标题，否则段评系统性错位、selfcheck 全跳过
 async function packQidian(bookId, textDir) {
   const bdir = path.join(QIDIAN_ROOT, String(bookId))
   const cjFile = path.join(bdir, '_chapters.json')
   const tkDir = path.join(bdir, 'tsukkomi')
   if (!fs.existsSync(cjFile) || !fs.existsSync(tkDir)) throw new Error('起点书数据不完整（缺 _chapters.json 或 tsukkomi/）')
   const chapters = JSON.parse(fs.readFileSync(cjFile, 'utf8'))
-  const titles = {}
-  for (const c of chapters) titles[String(c.chapter_index)] = c.chapter_title || ''
+  // 重排数据：_aligned.json {"起点章号": "txt索引(0基)"} + book/_txt_chapters.json（txt 标题，已剥「第X章」前缀）
+  let aligned = null, txtChapters = null
+  try { aligned = JSON.parse(fs.readFileSync(path.join(bdir, '_aligned.json'), 'utf8')) } catch {}
+  try { txtChapters = JSON.parse(fs.readFileSync(path.join(bdir, 'book', '_txt_chapters.json'), 'utf8')) } catch {}
+  const useTxtOrder = !!(aligned && txtChapters && Array.isArray(txtChapters) && txtChapters.length)
   // 书名
   let bookName = ''
   try { bookName = JSON.parse(fs.readFileSync(path.join(bdir, '_book.json'), 'utf8')).book_name || '' } catch {}
-  // 段评统计 + 文件表（segments → paragraphs）
+  // 段评统计 + 文件表（segments → paragraphs；重排到 txt 序）
   const files = []
   let tkTotal = 0
   const chTk = {}
+  const titles = {}
+  const chapterCount = useTxtOrder ? txtChapters.length : chapters.length
   for (const f of fs.readdirSync(tkDir)) {
     if (!f.endsWith('.json') || f.startsWith('_')) continue
+    const qdIdx = f.replace(/\.json$/, '').replace(/^0+/, '') // 剥前导零：文件名 0001 → aligned key "1"
+    let outName = f
+    let outKey = qdIdx
+    if (useTxtOrder) {
+      const t0 = aligned[qdIdx]
+      if (t0 === undefined || t0 === null) continue // 起点独有章（公告/感言等）txt 没有 → 不打包
+      const txtN = Number(t0) + 1
+      outName = String(txtN).padStart(4, '0') + '.json'
+      outKey = String(txtN)
+      const tc = txtChapters[Number(t0)]
+      titles[outKey] = (tc && tc.title) || ''
+    } else {
+      const c = chapters.find(x => String(x.chapter_index) === qdIdx)
+      titles[outKey] = (c && c.chapter_title) || ''
+    }
     const j = JSON.parse(fs.readFileSync(path.join(tkDir, f), 'utf8'))
     const paragraphs = (j.segments || []).map(s => ({
       paragraph_index: s.segmentId,
@@ -295,15 +317,15 @@ async function packQidian(bookId, textDir) {
       tsukkomi: s.tsukkomi || [],
     }))
     const n = paragraphs.reduce((a, p) => a + p.tsukkomi.length, 0)
-    chTk[f.replace(/\.json$/, '')] = n
+    chTk[outKey] = n
     tkTotal += n
-    files.push({ name: `tsukkomi/${f}`, data: Buffer.from(JSON.stringify({ ...j, paragraphs }), 'utf8') })
+    files.push({ name: `tsukkomi/${outName}`, data: Buffer.from(JSON.stringify({ ...j, paragraphs }), 'utf8') })
   }
   const meta = {
     book_id: String(bookId),
-    book_name: bookName || chapters[0]?.chapter_title?.replace(/^第.+章\s*/, '') || bookId,
+    book_name: bookName || (chapters[0] ? chapters[0].chapter_title.replace(/^第.+章\s*/, '') : '') || bookId,
     author: '',
-    chapter_count: chapters.length,
+    chapter_count: chapterCount,
     has_tsukkomi: files.length > 0,
     tsukkomi_count: tkTotal,
     chapter_tsukkomi: chTk,
@@ -311,8 +333,9 @@ async function packQidian(bookId, textDir) {
   }
   files.unshift({ name: 'meta.json', data: Buffer.from(JSON.stringify({ ...meta, titles }), 'utf8') })
   if (textDir && fs.existsSync(textDir)) {
-    for (const c of chapters) {
-      const pad = String(c.chapter_index).padStart(4, '0')
+    const nCh = useTxtOrder ? txtChapters.length : chapters.length
+    for (let i = 1; i <= nCh; i++) {
+      const pad = String(i).padStart(4, '0')
       for (const sub of ['book-chapters', 'chapters']) {
         const f = path.join(textDir, sub, pad + '.txt')
         if (fs.existsSync(f)) { files.push({ name: `chapters/${pad}.txt`, data: fs.readFileSync(f) }); break }

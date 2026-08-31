@@ -44,11 +44,13 @@
 | `ciweimao_vis_crawler.mjs` | 刺猬猫段评可视化爬虫面板 | `http://127.0.0.1:8788` |
 | `qidian_vis_crawler.mjs` | 起点本章说可视化爬虫面板（CDP 驱动） | `http://127.0.0.1:8791` |
 | `dbook_pack_panel.mjs` | `.dbook` 可视化打包面板 | `http://127.0.0.1:8789` |
-| `刺猬猫段评爬虫面板.bat` / `起点段评爬虫面板.bat` / `段评打包面板.bat` | Windows 双击启动器（自动开浏览器） | 双击运行 |
+| `txt2shelf_panel.mjs` | txt 转书架 + 段评自动精校准面板（滑窗标题匹配） | `http://127.0.0.1:8793` |
+| `刺猬猫段评爬虫面板.bat` / `起点段评爬虫面板.bat` / `段评打包面板.bat` / `txt2shelf校准面板.bat` | Windows 双击启动器（自动开浏览器） | 双击运行 |
 | `build_dbook.mjs` | `.dbook` 打包 CLI | 命令行 |
 | `build_dbook_from_crawler.mjs` | 爬虫数据 → `.dbook` CLI | 命令行 |
 | `qidian_crawler.mjs` | 起点本章说抓取 CLI（CDP 驱动） | 命令行 |
 | `epub2txt.mjs` | EPUB → 分章 TXT | 命令行 |
+| `txt2shelf.mjs` | TXT → 书架固定格式（`chapters/NNNN.txt` + `meta.json`），可直出 `.dbook` | 命令行 |
 | `gen_reader_html.mjs` / `build_index.mjs` | 生成网页版阅读器 | 命令行 |
 | `duoluoxi_app/` | 安卓「段评书架」App 源码 | Gradle 构建 |
 
@@ -128,6 +130,29 @@ node dbook_pack_panel.mjs
 > # 生成 book-output/book-chapters/NNNN.txt + chapters.json
 > ```
 
+### 第 2.5 步（可选）：txt 转书架 + 段评自动精校准
+
+手里只有 TXT 小说 + 抓好的段评时，用校准面板一步合成完整 `.dbook`：
+
+```bash
+node txt2shelf_panel.mjs
+# 浏览器打开 http://127.0.0.1:8793
+```
+
+> Windows 用户也可以直接**双击 `txt2shelf校准面板.bat`**。
+
+面板上：
+
+1. **txt 路径**：本机小说 txt 绝对路径（UTF-8/GBK 自动识别）
+2. **段评来源**：起点爬虫数据（填 `book_id`）或 `.dbook` 段评包（填路径）
+3. 点「**▶ 一键转换 + 自动校准 + 重排**」：
+   - 按固定格式切章（只认「第X章」，「第X卷/回」分卷标题自动跳过）
+   - **滑窗标题自动精校准**：txt 章标题 ↔ 段评源标题归一化匹配（剥前缀/删【】/统一间隔号），公告、感言、完本声明自动识别跳过；已存在的校准映射（含手动修正）优先复用
+   - 段评按校准映射重排到 txt 章序，段落号对齐（起点 `seg N` = txt 第 N 行）
+4. 点「**📦 打包 .dbook**」→ 输出正文 + 段评一体的完整书包 → App「＋ 导入书」直接导入
+
+校准报告实时显示：匹配章数 / 源独有跳过 / txt 无段评明细。
+
 ### 第 3 步：导入手机阅读
 
 1. 把 `.dbook` 文件传到手机（网盘 / USB / 微信文件传输均可）
@@ -197,6 +222,19 @@ node build_dbook_from_crawler.mjs <book_id> [--with-text <正文目录>] [--list
 node epub2txt.mjs "<epub路径>" [输出目录] [书名] [作者] [来源URL]
 ```
 
+### txt2shelf.mjs —— TXT 转书架固定格式
+
+```bash
+node txt2shelf.mjs <txt> <输出目录> [--book-id x] [--book-name x] [--author x] [--dbook out.dbook]
+```
+
+固定格式（与 `.dbook` 段评包 / App 对齐）：
+
+- 切章只认「第X章」（中文/阿拉伯数字），「第X卷/回」分卷标题跳过
+- `chapters/NNNN.txt` 文件名 = txt 全局章号，段评包 `tsukkomi/NNNN.json` 同名即匹配
+- `meta.titles[N]` = 剥「第X章」前缀后的纯标题（与段评包 titles 一致）
+- `--book-id` 与段评包 `book_id` 一致时，App 段评按文件名直接挂载、零错位
+
 ### gen_reader_html.mjs / build_index.mjs —— 网页版阅读器
 
 不需要安卓 App 时，可以直接生成静态 HTML 阅读站（正文 + 段评弹层 + 目录搜索页）：
@@ -217,6 +255,7 @@ BOOK_DIR=./book node build_index.mjs       # 生成 reader/index.html
 | `QIDIAN_DATA` | 起点爬虫数据目录 | `./qidian_data` |
 | `QIDIAN_CDP` | Chrome 调试端口地址 | `http://127.0.0.1:9222` |
 | `DBOOK_OUT` | 打包输出目录 | `./dbook_out` |
+| `TXT2SHELF_PORT` | 校准面板端口 | `8793` |
 | `BOOK_DIR` | 书目录（HTML 阅读器用） | `./book` |
 
 ---
@@ -245,6 +284,9 @@ A：默认并发 4、间隔 200ms 已很保守。别开太高并发刷，单本�
 
 **Q：App 里显示「导入段评」和「导入书」有什么区别？**
 A：导入书 = 完整书（正文+段评，覆盖旧版）；导入段评 = 只更新评论数据，正文不动。已导入的书想刷新评论用后者。
+
+**Q：txt 导入的书挂不上段评（自检跳过很多章）？**
+A：txt 转书架请用 `txt2shelf_panel.mjs`（或 CLI `txt2shelf.mjs`）走固定格式切章——只认「第X章」、跳过「第X卷/回」分卷标题，否则章号偏移会导致段评标题自检大量跳过。`--book-id` 与段评包 `book_id` 一致可完全绕开标题自检、按文件名直接挂载。
 
 **Q：段评里的 IP 是什么？**
 A：段评接口返回的评论者 IP 属地（如「浙江」），App 里展示在评论者旁边。

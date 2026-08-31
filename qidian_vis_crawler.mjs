@@ -5,6 +5,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import http from 'node:http'
+import { spawn } from 'node:child_process'
 
 const _here = path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'))
 const CDP_URL = process.env.QIDIAN_CDP || 'http://127.0.0.1:9222'
@@ -52,7 +53,17 @@ function connect(wsUrl) {
       call(method, params = {}) {
         return new Promise((res, rej) => {
           const mid = ++id
-          pending.set(mid, { res, rej })
+          // ★CDP 调用超时（45s）：ws 半开连接（TCP 活着但 Chrome 无响应）时 pending 永不 settle → worker 死等
+          // 超时强制关 ws → onclose 置 cdp=null → 下次 ensureCdp 自动重建连接
+          const timer = setTimeout(() => {
+            pending.delete(mid)
+            rej(new Error('CDP 调用超时（' + method + '）'))
+            try { ws.close() } catch (e) {}
+          }, 45000)
+          pending.set(mid, {
+            res: v => { clearTimeout(timer); res(v) },
+            rej: e => { clearTimeout(timer); rej(e) },
+          })
           ws.send(JSON.stringify({ id: mid, method, params }))
         })
       },
@@ -66,14 +77,186 @@ async function evaluate(expr) {
   if (r.exceptionDetails) throw new Error('页面执行异常: ' + String(r.exceptionDetails.exception?.description || r.exceptionDetails.text).slice(0, 300))
   return r.result?.value
 }
-async function pageFetch(url, headers = {}) {
+async function pageFetch(url, headers = {}, retryWaf = true) {
   // 在起点页面上下文内 fetch（同源自动带 cookie，绕过 WAF）
   const opt = { method: 'GET', headers: Object.assign({ 'Accept': 'application/json, text/plain, */*', 'Referer': 'https://www.qidian.com/' }, headers) }
-  const raw = await evaluate(`(async () => { try { const r = await fetch(${JSON.stringify(url)}, ${JSON.stringify(opt)}); const t = await r.text(); return JSON.stringify({ status: r.status, text: t }); } catch (e) { return JSON.stringify({ status: 0, error: String(e) }); } })()`)
+  let raw
+  try {
+    raw = await evaluate(`(async () => { try { const r = await fetch(${JSON.stringify(url)}, ${JSON.stringify(opt)}); const t = await r.text(); return JSON.stringify({ status: r.status, text: t }); } catch (e) { return JSON.stringify({ status: 0, error: String(e) }); } })()`)
+  } catch (e) {
+    // ★页面导航/刷新导致执行上下文销毁：等 WAF 刷新完成再重试
+    const em = String(e.message || e)
+    if (/navigated or closed|context destroyed|Cannot find context/.test(em)) {
+      if (retryWaf) { await wafRefresh(); return pageFetch(url, headers, false) }
+      throw e
+    }
+    throw e
+  }
   const j = JSON.parse(raw)
   if (j.error) throw new Error('页面fetch失败: ' + j.error)
-  if (j.status === 202) throw new Error('WAF 挑战页：请到浏览器里完成人机验证后重试')
+  // ★瑞数 WAF 令牌吊销检测：403 + probev3.js = 指纹失效，重载页面重新种 cookie
+  const isWaf = j.status === 403 || (j.status === 202) || (j.text && j.text.includes('probev3'))
+  if (isWaf) {
+    if (retryWaf) {
+      await wafRefresh()
+      return pageFetch(url, headers, false)
+    }
+    // 刷新后仍被拦 = 实例级拉黑（指纹在 Chrome 实例层，清 cookie 无效）→ 抛标记，workerLoop 触发 rotateChrome 轮换全新实例
+    throw new Error('WAF_BLOCKED')
+  }
   return j
+}
+// ★WAF 轻量自愈：先清 cookie + 重导航换会话（临时会话失效时够用）；仍被拦（WAF_BLOCKED）说明是实例级拉黑，workerLoop 会调 rotateChrome() 轮换全新 Chrome 实例
+let wafRefreshing = false
+let wafQueue = Promise.resolve()
+async function wafRefresh() {
+  const myTurn = wafQueue.then(() => {})
+  wafQueue = wafQueue.then(async () => {
+    if (wafRefreshing) return
+    wafRefreshing = true
+    try {
+      log('⚠️ WAF 拉黑会话，清 cookie 换新会话…')
+      try { await cdp.call('Network.clearBrowserCookies') } catch {}
+      // 回到书页（重新走 WAF 指纹流程 = 全新访客）
+      try {
+        await cdp.call('Page.navigate', { url: 'https://www.qidian.com/book/' + (task ? task.bookId : '') + '/' })
+      } catch {}
+      // ★给 probev3.js 充分时间重新计算指纹
+      await sleep(12000)
+      // 重导航后可能直接弹出腾讯滑块（IP 级风控信号）→ 暂停等人工；captchaHold 内部会自动检测恢复
+      await captchaHold('刷新后')
+    } finally {
+      wafRefreshing = false
+    }
+  })
+  await myTurn
+}
+// ---------- 腾讯滑块检测（人工验证） ----------
+// 瑞数 WAF 拉黑是实例级（轮换可解）；但出现腾讯滑块（turing.captcha）通常是 IP 级风控信号——
+// 轮换新实例也会被拦，正确做法是暂停任务、拉起 Chrome 窗口让用户手动过滑块（IP 解封后接口恢复）
+async function checkCaptcha() {
+  try {
+    if (!cdp) return false
+    // 1. 枚举所有 target（含 iframe），找腾讯滑块
+    const t = await cdp.call('Target.getTargets')
+    const urls = (t.targetInfos || []).map(x => x.url || '')
+    if (urls.some(u => /turing\.captcha|tcaptcha|captcha\.gtimg|drag_ele/i.test(u))) return true
+    // 2. 页面 DOM 里找滑块 iframe / 滑块元素
+    try {
+      const has = await evaluate(`!!document.querySelector('iframe[src*="turing"], iframe[src*="captcha"], iframe[src*="drag_ele"], .tc-drag-thumb, #tcaptcha_iframe, .yidun_panel')`)
+      return !!has
+    } catch { return false }
+  } catch { return false }
+}
+// 把 Chrome 窗口拉到前台（用户去过滑块）：按 CDP 端口找监听进程 PID，AppActivate 激活
+async function bringChromeFront() {
+  try {
+    const cdpPort = new URL(CDP_URL).port || '9222'
+    const ps = spawn('powershell', ['-NoProfile', '-Command',
+      `$c=Get-NetTCPConnection -LocalPort ${cdpPort} -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1; if($c){(New-Object -ComObject WScript.Shell).AppActivate($c.OwningProcess)}`],
+      { stdio: 'ignore', detached: true })
+    ps.unref()
+  } catch {}
+}
+// 检测到滑块：暂停任务 + 拉窗口 + 醒目提示；★轮询等滑块消失（用户拖完滑块）自动恢复，无需手动点继续
+async function captchaHold(who) {
+  const hit = await checkCaptcha()
+  if (!hit) return false
+  if (task) task.paused = true
+  log(`🧍 检测到腾讯滑块验证（${who}）！已暂停任务——请到弹出的 Chrome 窗口拖动滑块完成验证，本小姐会自动检测恢复…`)
+  await bringChromeFront()
+  // ★自动恢复：每 10s 检测一次滑块是否消失（用户完成验证后 iframe 会关闭），消失即恢复抓取
+  if (task) {
+    let waited = 0
+    while (task.running && task.paused && waited < 300) { // 最多等 50 分钟
+      await sleep(10000)
+      waited += 10
+      if (!(await checkCaptcha())) {
+        task.paused = false
+        log(`🧍 滑块验证已通过！自动继续抓取…`)
+        await sleep(3000) // 给 IP 解封一点生效时间
+        break
+      }
+    }
+  }
+  return true
+}
+// ---------- WAF 实例轮换 ----------
+// 瑞数拉黑的是 Chrome 实例（浏览器指纹层），清 cookie/reload 无效 → 检测到持续拉黑时杀旧实例、起全新 profile 实例（全新指纹=干净访客）
+let rotating = false
+async function findChrome() {
+  if (process.env.CHROME_PATH && fs.existsSync(process.env.CHROME_PATH)) return process.env.CHROME_PATH
+  const cands = [
+    'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+    'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+    process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Google', 'Chrome', 'Application', 'chrome.exe') : '',
+  ]
+  for (const c of cands) if (c && fs.existsSync(c)) return c
+  throw new Error('找不到 chrome.exe：请设置环境变量 CHROME_PATH 指向 chrome.exe 完整路径（自动轮换功能需要）')
+}
+async function rotateChrome() {
+  if (rotating) { await sleep(15000); return false }
+  rotating = true
+  try {
+    const bookUrl = task && task.bookId ? `https://www.qidian.com/book/${task.bookId}/` : 'https://www.qidian.com/'
+    const cdpPort = new URL(CDP_URL).port || '9222'
+    log('🔄 实例级 WAF 拉黑 → 关闭旧 Chrome，轮换全新实例…')
+    // 1. 关闭当前 Chrome 实例（Browser.close 关整个浏览器，含所有标签页）
+    let closed = false
+    try {
+      const ver = await (await fetch(CDP_URL + '/json/version')).json()
+      if (ver.webSocketDebuggerUrl) {
+        const bws = await connect(ver.webSocketDebuggerUrl)
+        await bws.call('Browser.close')
+        closed = true
+      }
+    } catch (e) { log('  Browser.close 失败: ' + String(e.message || e).slice(0, 100)) }
+    if (!closed) { try { if (cdp) await cdp.close() } catch {} }
+    cdp = null
+    // 2. 等端口释放（浏览器进程完全退出）
+    for (let i = 0; i < 40; i++) {
+      try { await fetch(CDP_URL + '/json/version'); await sleep(500) } catch { break }
+      await sleep(500)
+    }
+    await sleep(1500)
+    // 3. 起新 Chrome：同 CDP 端口 + 全新独立 profile（全新指纹）
+    const profile = path.join(_here, '_qidian_auto_' + Math.random().toString(36).slice(2, 10))
+    const chromePath = await findChrome()
+    const args = [
+      `--remote-debugging-port=${cdpPort}`,
+      `--user-data-dir=${profile}`,
+      '--no-first-run', '--no-default-browser-check', '--disable-fre', '--no-sandbox',
+      bookUrl,
+    ]
+    log(`  新实例: ${chromePath} (端口 ${cdpPort}, profile ${path.basename(profile)})`)
+    const child = spawn(chromePath, args, { detached: true, stdio: 'ignore' })
+    child.unref()
+    // 4. 等 CDP 就绪
+    let ok = false
+    for (let i = 0; i < 60; i++) {
+      try { const l = await (await fetch(CDP_URL + '/json/version')).json(); if (l.webSocketDebuggerUrl) { ok = true; break } } catch {}
+      await sleep(500)
+    }
+    if (!ok) { log('❌ 新 Chrome 实例启动失败，请手动重启浏览器后继续'); return false }
+    // 5. 等起点书页出现（含 WAF 指纹计算），重建连接
+    let tabFound = false
+    for (let i = 0; i < 30; i++) {
+      try {
+        const page = await findPageTab()
+        if (page) { cdpPageUrl = page.url; if (!cdp) cdp = await connect(page.webSocketDebuggerUrl); tabFound = true; break }
+      } catch {}
+      await sleep(1000)
+    }
+    if (!tabFound) { log('❌ 新实例找不到起点页面标签'); return false }
+    await sleep(3000) // 等指纹 + 首屏渲染
+    log('✅ 新 Chrome 实例就绪，继续抓取')
+    return true
+  } catch (e) {
+    log('❌ 轮换失败: ' + String(e.message || e).slice(0, 150))
+    return false
+  } finally {
+    rotating = false
+  }
 }
 async function getCsrf() {
   const v = await evaluate(`(document.cookie.match(/_csrfToken=([^;]+)/)||[])[1]||''`)
@@ -168,20 +351,27 @@ function simplify(r) {
 }
 
 async function fetchChapter(ch, delay) {
+  // ★csrf 章节内缓存（页面刷新/重连后缓存失效，下次自动重取）
+  let csrf = ''
+  const getC = async () => { if (!csrf) csrf = await getCsrf(); return csrf }
   const sum = await pageFetch('https://www.qidian.com/ajax/chapterReview/reviewSummary?' + new URLSearchParams({
-    bookId: ch.book_id, chapterId: ch.chapter_id, _csrfToken: await getCsrf(),
+    bookId: ch.book_id, chapterId: ch.chapter_id, _csrfToken: await getC(),
   }))
   const obj = JSON.parse(sum.text)
   if (obj.code !== 0) throw new Error('reviewSummary code=' + obj.code + ' ' + (obj.msg || ''))
   const segments = (obj.data && obj.data.list) || []
   const out = []
   for (const seg of segments) {
+    // ★空段落（0 段评）跳过：省一次 reviewList 请求（起点段落很多是空的）
+    if (!seg.reviewNum) continue
     const reviews = []
     let page = 1
+    // ★翻页上限按实际段评数推算（防接口异常死循环，又不误杀 1000+ 条的大段落）
+    const maxPage = Math.ceil((seg.reviewNum || 0) / 10) + 10
     for (;;) {
       const r = await pageFetch('https://www.qidian.com/ajax/chapterReview/reviewList?' + new URLSearchParams({
         bookId: ch.book_id, chapterId: ch.chapter_id, page: String(page), pageSize: '10',
-        segmentId: String(seg.segmentId), type: '2', _csrfToken: await getCsrf(),
+        segmentId: String(seg.segmentId), type: '2', _csrfToken: await getC(),
       }))
       const j = JSON.parse(r.text)
       if (j.code !== 0) throw new Error('reviewList code=' + j.code + ' ' + (j.msg || ''))
@@ -190,8 +380,7 @@ async function fetchChapter(ch, delay) {
       reviews.push(...list)
       if (list.length < 10) break
       page++
-      // ★分页上限：服务端忽略 page 参数恒返回 10 条时防死循环
-      if (page > 100) break
+      if (page > maxPage) break
       await sleep(delay)
     }
     out.push({ segmentId: seg.segmentId, reviewNum: seg.reviewNum, isHot: !!seg.isHotSegment, tsukkomi: reviews.map(simplify) })
@@ -243,17 +432,62 @@ async function workerLoop(wid, delay) {
       log(`[w${wid}] #${ch.chapter_index} ${ch.chapter_title} 段=${data.segments.length} 段评=${t} ✓`)
       saveState()
     } catch (e) {
-      // ★attempts 上限：连续失败 3 次标记失败跳过（防 WAF 验证不过时任务死循环永不结束）
+      const msg = String(e.message || e)
       const item = q.find(it => it.ch.chapter_index === ch.chapter_index)
+      if (!item) continue
+      // ★实例级拉黑（wafRefresh 已试过无效 / 页面被 WAF 挑战页顶掉丢失 _csrfToken）：轮换全新 Chrome 实例；同一章轮换 3 次仍被拦则标记失败防死循环
+      if (msg.includes('WAF_BLOCKED') || /csrfToken|页面缺少/.test(msg)) {
+        // 先查有没有腾讯滑块：有 = IP 级风控，轮换没用 → 暂停等用户人工过滑块
+        if (await captchaHold('WAF_BLOCKED')) continue
+        item.wafTries = (item.wafTries || 0) + 1
+        if (item.wafTries >= 3) {
+          item.done = true
+          task.failed++
+          log(`[w${wid}] #${ch.chapter_index} ${ch.chapter_title} 轮换 3 次仍被 WAF 拦，标记失败跳过`)
+        } else {
+          item.done = false
+          item.attempts = 0 // 轮换不累计普通失败计数
+          log(`[w${wid}] #${ch.chapter_index} ${ch.chapter_title} 实例拉黑，轮换新 Chrome（第${item.wafTries}/3次）…`)
+          await rotateChrome()
+        }
+        continue
+      }
+      // ★WAF 刷新重试：页面 reload 后上下文被销毁 / 指纹失效抛的错——不计数，等刷新完自动重试
+      if (/navigated or closed|context destroyed|Cannot find context|WAF/.test(msg)) {
+        await sleep(1500)
+        if (task.running) { item.done = false; log(`[w${wid}] #${ch.chapter_index} ${ch.chapter_title} WAF刷新，稍后重试…`) }
+        continue
+      }
+      // ★CDP 断连/调用超时（轮换/浏览器崩溃/半开连接导致）：不计数，等连接重建后重试
+      if (/CDP 连接断开|CDP 调用超时|ws:|fetch failed|CDP 未连接/.test(msg)) {
+        await sleep(2000)
+        if (task.running) { item.done = false; log(`[w${wid}] #${ch.chapter_index} CDP 断连，重建后重试…`) }
+        continue
+      }
+      // ★业务限流（reviewList code=1）：等待后重试，不累计普通失败（限流是暂时的，跳过会丢数据）
+      if (/reviewList code=1|reviewSummary code=1/.test(msg)) {
+        item.limitTries = (item.limitTries || 0) + 1
+        if (item.limitTries >= 20) {
+          item.done = true
+          task.failed++
+          log(`[w${wid}] #${ch.chapter_index} ${ch.chapter_title} 限流重试 20 次仍失败，标记跳过`)
+        } else {
+          item.done = false
+          log(`[w${wid}] #${ch.chapter_index} ${ch.chapter_title} 业务限流(code=1)，等待 10s 重试（第${item.limitTries}/20次）…`)
+          await sleep(10000)
+        }
+        continue
+      }
+      // ★attempts 上限：连续失败 3 次标记失败跳过（防 WAF 验证不过时任务死循环永不结束）
       if (item) {
         item.attempts = (item.attempts || 0) + 1
         if (item.attempts >= 3) {
           item.done = true
           task.failed++
-          log(`[w${wid}] #${ch.chapter_index} ${ch.chapter_title} 连续失败 ${item.attempts} 次，标记失败跳过: ${String(e.message || e).slice(0, 140)}`)
+          log(`[w${wid}] #${ch.chapter_index} ${ch.chapter_title} 连续失败 ${item.attempts} 次，标记失败跳过: ${msg.slice(0, 140)}`)
         } else {
           item.done = false
-          log(`[w${wid}] #${ch.chapter_index} ${ch.chapter_title} FAIL(第${item.attempts}/3次): ${String(e.message || e).slice(0, 140)}`)
+          log(`[w${wid}] #${ch.chapter_index} ${ch.chapter_title} FAIL(第${item.attempts}/3次): ${msg.slice(0, 140)}`)
         }
       }
     }
@@ -374,6 +608,11 @@ const server = http.createServer(async (req, res) => {
       if (task && task.running) { task.paused = !task.paused; log(task.paused ? '已暂停' : '已继续') }
       return json(res, 200, { paused: task?.paused || false })
     }
+    if (req.method === 'POST' && p === '/api/rotate') {
+      // 手动触发 WAF 实例轮换（页面被挑战页顶掉/无 _csrfToken 时用）
+      const ok = await rotateChrome()
+      return json(res, 200, { ok })
+    }
     if (req.method === 'POST' && p === '/api/stop') {
       if (task) { task.running = false; task.paused = false; saveState(); log('已停止，进度已保存') }
       return json(res, 200, { ok: true })
@@ -437,7 +676,8 @@ button.ghost { background:#2a2f38; color:var(--fg); font-weight:400; }
   <div class="hint">
     步骤：① 启动 Chrome：<code>chrome.exe --remote-debugging-port=9222 --user-data-dir=某个独立目录</code><br>
     ② 在打开的 Chrome 里访问 <code>https://www.qidian.com/</code>（任意书页即可，无需登录）<br>
-    ③ 回到本页面点「重新检测」。爬虫会借用该浏览器抓取，期间别关标签页。
+    ③ 回到本页面点「重新检测」。爬虫会借用该浏览器抓取，期间别关标签页。<br>
+    <span style="color:var(--acc)">🛡 遇到 WAF 实例级拉黑时面板会自动关掉旧 Chrome、轮换全新实例继续抓取（自动找 chrome.exe，或用环境变量 CHROME_PATH 指定路径）</span>
   </div>
   <div class="row"><button id="btnCdp" class="ghost">🔄 重新检测</button></div>
 </div>
