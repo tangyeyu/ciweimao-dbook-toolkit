@@ -333,7 +333,9 @@ function showPage(p, dir) {
   var idx = p - 1
   curPage = p
   document.getElementById('pgInfo').textContent = p + ' / ' + pageCount
-  // 进度防抖：翻页不写盘（避免每次翻页同步 I/O），由 saveProg() 在切章/离开时持久化
+  // 翻页进度写盘：节流 250ms（连续翻页只写最后一次），避免退出重进回到章首
+  // pagehide 兜底见文件尾；setItem 只写 "章:页" 几个字符，开销可忽略
+  scheduleSaveProg()
   // 无动画直接切换（dir 参数保留兼容调用处）
   pagesEl.querySelectorAll('.page').forEach(function(el) {
     el.classList.toggle('active', Number(el.dataset.pg) === idx)
@@ -342,6 +344,11 @@ function showPage(p, dir) {
 }
 function saveProg() {
   try { localStorage.setItem('prog:' + bookId, curChapter + ':' + curPage) } catch(e){}
+}
+var _progTimer = null
+function scheduleSaveProg() {
+  if (_progTimer) clearTimeout(_progTimer)
+  _progTimer = setTimeout(function(){ _progTimer = null; saveProg() }, 250)
 }
 
 async function loadChapter(i, toPage) {
