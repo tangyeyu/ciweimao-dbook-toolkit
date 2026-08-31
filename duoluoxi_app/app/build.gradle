@@ -10,8 +10,8 @@ android {
         applicationId "com.duoluoxi.reader"
         minSdk 26
         targetSdk 34
-        versionCode 16
-        versionName "3.4"
+        versionCode 17
+        versionName "3.5"
         // App 显示名动态带版本号：段评书架 v3.1（升级只改 versionName）
         resValue "string", "app_name", "段评书架 v${versionName}"
     }

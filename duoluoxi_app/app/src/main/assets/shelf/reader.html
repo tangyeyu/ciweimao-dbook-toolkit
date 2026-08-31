@@ -6,14 +6,13 @@
 <title>阅读</title>
 <style>
 * { box-sizing:border-box; margin:0; padding:0; -webkit-tap-highlight-color:transparent; }
-:root { --bg:#13151a; --card:#1b1e25; --fg:#b9bec9; --dim:#767c8a; --acc:#e8a33d; --line:#252a33; }
-body.light { --bg:#f6f2e9; --card:#fffcf5; --fg:#3a372e; --dim:#8f887a; --line:#e5deca; }
+:root { --bg:#13151a; --card:#1b1e25; --fg:#b9bec9; --dim:#767c8a; --acc:#e8a33d; --line:#252a33; --tb:rgba(19,21,26,.92); }
+body.light { --bg:#f6f2e9; --card:#fffcf5; --fg:#3a372e; --dim:#8f887a; --line:#e5deca; --tb:rgba(246,242,233,.88); }
 body { background:var(--bg); color:var(--fg); font:17px/1.78 "Microsoft YaHei",sans-serif; transition:background .3s,color .3s; overflow-x:hidden; }
-.topbar { position:sticky; top:0; z-index:10; background:var(--bg); border-bottom:1px solid var(--line); display:flex; align-items:center; padding:11px 14px; gap:6px; transition:transform .3s ease,opacity .3s ease; }
-/* 隐藏阅读 UI（点屏幕中间切换）：顶栏上滑、底栏下滑，正文占满全屏，最后一行不再被底部 ui 挡到 */
+.topbar { position:fixed; top:0; left:0; right:0; z-index:10; background:var(--tb); backdrop-filter:blur(6px); border-bottom:1px solid var(--line); display:flex; align-items:center; padding:11px 14px; gap:6px; transition:transform .3s ease,opacity .3s ease; }
+/* 隐藏阅读 UI（点屏幕中间切换）：顶栏上滑、底栏下滑；顶/底栏为 fixed 半透明浮层不占文档流，正文布局恒定不跳动 */
 body.ui-hidden .topbar { transform:translateY(-100%); opacity:0; pointer-events:none; }
 body.ui-hidden #pager { transform:translateY(100%); opacity:0; pointer-events:none; }
-/* #pages 的 margin-top 由 JS 动态补偿（topbar 为 sticky 占文档流，隐藏时负 margin 顶上全屏） */
 .topbar .back { font-size:20px; cursor:pointer; padding:2px 8px; }
 .topbar .t { flex:1; text-align:center; font-size:14px; color:var(--dim); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .topbar .icon { font-size:16px; cursor:pointer; padding:2px 6px; user-select:none; }
@@ -49,10 +48,10 @@ body.ui-hidden #pager { transform:translateY(100%); opacity:0; pointer-events:no
 .tk .reply { margin-top:6px; padding:6px 10px; background:var(--bg); border-radius:8px; font-size:12.5px; color:var(--fg); }
 .tk .reply .ru { color:var(--acc); font-size:11px; }
 .tk .reply .rt { float:right; font-size:10px; color:var(--dim); margin-left:8px; }
-#nav { position:fixed; bottom:0; left:0; right:0; z-index:10; display:flex; background:var(--bg); border-top:1px solid var(--line); }
+#nav { position:fixed; bottom:0; left:0; right:0; z-index:10; display:flex; background:var(--tb); border-top:1px solid var(--line); }
 #nav button { flex:1; padding:13px; background:none; border:none; color:var(--fg); font-size:14px; cursor:pointer; }
 #nav button:disabled { color:var(--line); }
-#pager { position:fixed; bottom:0; left:0; right:0; z-index:10; display:flex; align-items:center; justify-content:center; gap:20px; background:var(--bg); border-top:1px solid var(--line); padding:9px 0; font-size:13px; color:var(--dim); }
+#pager { position:fixed; bottom:0; left:0; right:0; z-index:10; display:flex; align-items:center; justify-content:center; gap:20px; background:var(--tb); backdrop-filter:blur(6px); border-top:1px solid var(--line); padding:9px 0; font-size:13px; color:var(--dim); }
 #pager .pg { min-width:70px; text-align:center; font-variant-numeric:tabular-nums; font-size:13px; letter-spacing:.3px; }
 #pager button { background:none; border:none; color:var(--fg); font-size:15px; cursor:pointer; padding:4px 10px; }
 #pager button:disabled { color:var(--line); }
@@ -132,6 +131,8 @@ function get(path) {
 
 async function init() {
   try {
+    // 顶栏是 fixed 半透明浮层：给 body 留出顶栏高度（恒定，不随隐藏变），正文从顶栏下方开始，隐藏时布局不变
+    document.body.style.paddingTop = document.querySelector('.topbar').getBoundingClientRect().height + 'px'
     var m = JSON.parse(await get('meta.json'))
     meta = m
     total = m.chapter_count || 0
@@ -174,7 +175,6 @@ function showChapters(v) {
   // 打开目录时强制显示阅读 UI（否则顶栏的返回/目录按钮被隐藏用不了）
   if (v) {
     document.body.classList.remove('ui-hidden')
-    document.getElementById('pages').style.marginTop = ''
   }
   document.getElementById('chapters').style.display = v ? 'block' : 'none'
   document.getElementById('pages').style.display = v ? 'none' : 'block'
@@ -279,20 +279,16 @@ function relayout() {
   updateNavButtons()
 }
 function pageHeight() {
-  // ★隐藏阅读 UI 时顶/底栏不占高度（正文全屏），否则正常减
-  var hidden = document.body.classList.contains('ui-hidden')
-  var top = hidden ? 0 : document.querySelector('.topbar').getBoundingClientRect().height
-  var bot = hidden ? 0 : document.getElementById('pager').getBoundingClientRect().height
+  // 顶/底栏是 fixed 半透明浮层不占文档流：正文可用高度恒定（无论 UI 是否隐藏），布局不跳
+  var top = document.querySelector('.topbar').getBoundingClientRect().height
+  var bot = document.getElementById('pager').getBoundingClientRect().height
   // 减去 .page 上下内边距（18px + 22px），否则末行被 overflow:hidden 裁掉
   return window.innerHeight - top - bot - 40
 }
 // 显示/隐藏阅读 UI（点屏幕中间切换）：顶栏上滑、底栏下滑、正文补满全屏并重排
 function toggleUI() {
-  var b = document.body
-  var hidden = b.classList.toggle('ui-hidden')
-  var topH = document.querySelector('.topbar').getBoundingClientRect().height
-  document.getElementById('pages').style.marginTop = hidden ? ('-' + topH + 'px') : ''
-  relayout()
+  // 只切换顶/底栏显隐（半透明浮层淡出/淡入），正文布局与分页完全不变，不重排
+  document.body.classList.toggle('ui-hidden')
 }
 function layoutPages(rawLines) {
   var H = pageHeight()
@@ -501,9 +497,6 @@ function showTks(para, chap) {
   _tkList = list; _tkShown = 0; _tkLoading = false
   document.getElementById('tkList').innerHTML = ''
   renderTkBatch()
-  // 强制恢复阅读 UI（弹层打开时顶/底栏必须可见，否则关闭后无法操作）
-  document.body.classList.remove('ui-hidden')
-  document.getElementById('pages').style.marginTop = ''
   openSheet()
 }
 // 段评列表滚动到底自动加载下一批
